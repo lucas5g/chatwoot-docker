@@ -1,0 +1,25 @@
+diff --git a/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue b/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue
+index aa67cda0b..130f7324b 100644
+--- a/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue
++++ b/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue
+@@ -205,6 +205,8 @@ export default {
+     },
+     isReplyButtonDisabled() {
+       if (this.isATwitterInbox) return true;
++      //Bloqueia envio de mensagens públicas se conversa não está aberta
++      if(!this.isPrivate && !this.isConversationOpen) return true;
+       if (this.hasAttachments || this.hasRecordedAudio) return false;
+ 
+       return (
+@@ -422,7 +424,10 @@ export default {
+         ? this.messageSignature
+         : extractTextFromMarkdown(this.messageSignature);
+     },
+-  },
++    isConversationOpen(){
++      return this.currentChat?.status === wootConstants.STATUS_TYPE.OPEN;
++    }
++  },  
+   watch: {
+     currentChat(conversation, oldConversation) {
+       const { can_reply: canReply } = conversation;
