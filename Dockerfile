@@ -4,6 +4,9 @@ FROM chatwoot/chatwoot:v4.9.2
 RUN apk add --no-cache nodejs npm patch && \
     npm install -g pnpm@10
 
+# 0 - Atualiza a versão exibida no rodapé do Chatwoot
+RUN sed -i '54i\      <span class="px-2">14/01/26</span>' app/javascript/dashboard/routes/dashboard/settings/account/components/BuildInfo.vue
+
 # Copia os patches para o container
 COPY patchs/ /tmp/patchs/
 
