@@ -1,0 +1,13 @@
+diff --git a/app/javascript/dashboard/constants/permissions.js b/app/javascript/dashboard/constants/permissions.js
+index 1ecbd9793..722f09100 100644
+--- a/app/javascript/dashboard/constants/permissions.js
++++ b/app/javascript/dashboard/constants/permissions.js
+@@ -45,7 +45,7 @@ export const ASSIGNEE_TYPE_TAB_PERMISSIONS = {
+   all: {
+     count: 'allCount',
+     permissions: [
+-      ...ROLES,
++      'administrator',
+       MANAGE_ALL_CONVERSATION_PERMISSIONS,
+       CONVERSATION_PARTICIPATING_PERMISSIONS,
+     ],

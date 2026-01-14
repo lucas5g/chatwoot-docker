@@ -1,0 +1,16 @@
+diff --git a/app/javascript/dashboard/components-next/message/Message.vue b/app/javascript/dashboard/components-next/message/Message.vue
+index 6fa7ff2b2..02cd7fd0b 100644
+--- a/app/javascript/dashboard/components-next/message/Message.vue
++++ b/app/javascript/dashboard/components-next/message/Message.vue
+@@ -360,10 +360,7 @@ const contextMenuEnabledOptions = computed(() => {
+ 
+   return {
+     copy: hasText,
+-    delete:
+-      (hasText || hasAttachments) &&
+-      !isFailedOrProcessing &&
+-      !isMessageDeleted.value,
++    delete: false,    
+     cannedResponse: isOutgoing && hasText && !isMessageDeleted.value,
+     copyLink: !isFailedOrProcessing,
+     translate: !isFailedOrProcessing && !isMessageDeleted.value && hasText,

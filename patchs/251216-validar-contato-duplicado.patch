@@ -1,0 +1,45 @@
+diff --git a/app/models/contact.rb b/app/models/contact.rb
+index 0dc92b51e..c81c246bc 100644
+--- a/app/models/contact.rb
++++ b/app/models/contact.rb
+@@ -54,6 +54,8 @@ class Contact < ApplicationRecord
+   validates :phone_number,
+             allow_blank: true, uniqueness: { scope: [:account_id] },
+             format: { with: /\+[1-9]\d{1,14}\z/, message: I18n.t('errors.contacts.phone_number.invalid') }
++  validate :phone_number_not_duplicate_by_suffix, if: -> { phone_number.present? && phone_number_changed? }
++
+ 
+   belongs_to :account
+   has_many :conversations, dependent: :destroy_async
+@@ -245,5 +247,19 @@ class Contact < ApplicationRecord
+   def dispatch_destroy_event
+     Rails.configuration.dispatcher.dispatch(CONTACT_DELETED, Time.zone.now, contact: self)
+   end
++
++  def phone_number_not_duplicate_by_suffix
++   last_8_digits = phone_number.gsub(/\D/, '').last(8)
++    return if last_8_digits.length < 8
++
++    existing_contact = account.contacts
++                              .where.not(id: id)
++                              .where('RIGHT(REGEXP_REPLACE(phone_number, \'\\D\', \'\', \'g\'), 8) = ?', last_8_digits)
++                              .exists?
++
++    return unless existing_contact
++
++    errors.add(:phone_number, I18n.t('errors.contacts.phone_number.duplicate_suffix'))
++  end
+ end
+ Contact.include_mod_with('Concerns::Contact')
+diff --git a/config/locales/pt_BR.yml b/config/locales/pt_BR.yml
+index 9163ad193..74c4bc53f 100644
+--- a/config/locales/pt_BR.yml
++++ b/config/locales/pt_BR.yml
+@@ -63,6 +63,7 @@ pt_BR:
+         invalid: E-mail inválido
+       phone_number:
+         invalid: deve estar no formato e164
++        duplicate_suffix: já existe um contato com este número
+     companies:
+       domain:
+         invalid: must be a valid domain name

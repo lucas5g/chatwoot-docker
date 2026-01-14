@@ -1,0 +1,29 @@
+diff --git a/app/models/concerns/auto_assignment_handler.rb b/app/models/concerns/auto_assignment_handler.rb
+index a1198200a..b9a1ae81d 100644
+--- a/app/models/concerns/auto_assignment_handler.rb
++++ b/app/models/concerns/auto_assignment_handler.rb
+@@ -4,6 +4,7 @@ module AutoAssignmentHandler
+ 
+   included do
+     after_save :run_auto_assignment
++    after_save :trigger_reassignment_on_resolve
+   end
+ 
+   private
+@@ -29,4 +30,16 @@ module AutoAssignmentHandler
+     # run only if assignee is blank or doesn't have access to inbox
+     assignee.blank? || inbox.members.exclude?(assignee)
+   end
++  def trigger_reassignment_on_resolve
++    return unless saved_change_to_status? && resolved?
++    return unless inbox.enable_auto_assignment?
++    if inbox.auto_assignment_v2_enabled?
++      AutoAssignment::AssignmentJob.perform_later(inbox_id: inbox.id)
++    else
++      unassigned = inbox.conversations.unassigned.open.where.not(id: id).order(:created_at).first
++      return unless unassigned
++      AutoAssignment::AgentAssignmentService.new(conversation: unassigned, allowed_agent_ids: inbox.member_ids_with_assignment_capacity).perform
++    end
++  end
++
+ end

@@ -1,0 +1,57 @@
+diff --git a/app/builders/conversation_builder.rb b/app/builders/conversation_builder.rb
+index 6a995b188..bd3312743 100644
+--- a/app/builders/conversation_builder.rb
++++ b/app/builders/conversation_builder.rb
+@@ -2,11 +2,23 @@ class ConversationBuilder
+   pattr_initialize [:params!, :contact_inbox!]
+ 
+   def perform
+-    look_up_exising_conversation || create_new_conversation
++    look_up_exising_conversation || block_if_open_conversation || create_new_conversation
+   end
+ 
+   private
+ 
++  def block_if_open_conversation
++    open_conversation = @contact_inbox.contact.conversations
++                          .where(status: [:open])
++                          .first
++    return nil unless open_conversation
++
++    conversation = Conversation.new
++    conversation.errors.add(:base, "Contato já possui uma conversa aberta ##{open_conversation.display_id}")
++    raise ActiveRecord::RecordInvalid.new(conversation)
++  end
++
++
+   def look_up_exising_conversation
+     return unless @contact_inbox.inbox.lock_to_single_conversation?
+ 
+diff --git a/app/javascript/dashboard/components-next/NewConversation/ComposeConversation.vue b/app/javascript/dashboard/components-next/NewConversation/ComposeConversation.vue
+index ee71bf51a..8148655e4 100644
+--- a/app/javascript/dashboard/components-next/NewConversation/ComposeConversation.vue
++++ b/app/javascript/dashboard/components-next/NewConversation/ComposeConversation.vue
+@@ -176,8 +176,8 @@ const createConversation = async ({ payload, isFromWhatsApp }) => {
+     return true; // Return success
+   } catch (error) {
+     useAlert(
+-      error instanceof ExceptionWithMessage
+-        ? error.data
++      error?.message && error.message !== "Error"
++        ? error.message
+         : t('COMPOSE_NEW_CONVERSATION.FORM.ERROR_MESSAGE')
+     );
+     return false; // Return failure
+diff --git a/app/javascript/dashboard/store/modules/contactConversations.js b/app/javascript/dashboard/store/modules/contactConversations.js
+index 55dfcf441..8e631ae00 100644
+--- a/app/javascript/dashboard/store/modules/contactConversations.js
++++ b/app/javascript/dashboard/store/modules/contactConversations.js
+@@ -103,7 +103,7 @@ export const actions = {
+ 
+       return data;
+     } catch (error) {
+-      throw new Error(error);
++      throw error?.response?.data?.message ? new Error(error.response.data.message) : new Error(error);
+     } finally {
+       commit(types.default.SET_CONTACT_CONVERSATIONS_UI_FLAG, {
+         isCreating: false,
