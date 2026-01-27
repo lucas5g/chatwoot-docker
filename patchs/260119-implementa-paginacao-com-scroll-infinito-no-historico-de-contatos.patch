@@ -1,0 +1,337 @@
+diff --git a/app/controllers/api/v1/accounts/contacts/conversations_controller.rb b/app/controllers/api/v1/accounts/contacts/conversations_controller.rb
+index 20d66fb4d..c118215ae 100644
+--- a/app/controllers/api/v1/accounts/contacts/conversations_controller.rb
++++ b/app/controllers/api/v1/accounts/contacts/conversations_controller.rb
+@@ -12,6 +12,6 @@ class Api::V1::Accounts::Contacts::ConversationsController < Api::V1::Accounts::
+       Current.account
+     ).perform
+ 
+-    @conversations = conversations.order(last_activity_at: :desc).limit(20)
++    @conversations = conversations.order(last_activity_at: :desc).page(params[:page]).per(10)
+   end
+ end
+diff --git a/app/javascript/dashboard/api/contacts.js b/app/javascript/dashboard/api/contacts.js
+index 1e76ac987..dc5e03e88 100644
+--- a/app/javascript/dashboard/api/contacts.js
++++ b/app/javascript/dashboard/api/contacts.js
+@@ -35,8 +35,8 @@ class ContactAPI extends ApiClient {
+     return axios.patch(`${this.url}/${id}?include_contact_inboxes=false`, data);
+   }
+ 
+-  getConversations(contactId) {
+-    return axios.get(`${this.url}/${contactId}/conversations`);
++  getConversations(contactId, page = 1) {
++    return axios.get(`${this.url}/${contactId}/conversations?page=${page}`);
+   }
+ 
+   getContactableInboxes(contactId) {
+diff --git a/app/javascript/dashboard/components-next/Contacts/ContactsSidebar/ContactHistory.vue b/app/javascript/dashboard/components-next/Contacts/ContactsSidebar/ContactHistory.vue
+index 3763d198a..789560276 100644
+--- a/app/javascript/dashboard/components-next/Contacts/ContactsSidebar/ContactHistory.vue
++++ b/app/javascript/dashboard/components-next/Contacts/ContactsSidebar/ContactHistory.vue
+@@ -1,11 +1,12 @@
+ <script setup>
+-import { computed } from 'vue';
+-import { useMapGetter } from 'dashboard/composables/store';
++import { computed, ref } from 'vue';
++import { useMapGetter, useStore } from 'dashboard/composables/store';
+ import { useRoute } from 'vue-router';
+ import { useI18n } from 'vue-i18n';
+ 
+ import Spinner from 'dashboard/components-next/spinner/Spinner.vue';
+ import ConversationCard from 'dashboard/components-next/Conversation/ConversationCard/ConversationCard.vue';
++import IntersectionObserver from 'dashboard/components/IntersectionObserver.vue';
+ 
+ const { t } = useI18n();
+ const route = useRoute();
+@@ -16,20 +17,50 @@ const conversations = useMapGetter(
+ const contactsById = useMapGetter('contacts/getContactById');
+ const stateInbox = useMapGetter('inboxes/getInboxById');
+ const accountLabels = useMapGetter('labels/getLabels');
++const store = useStore();
+ 
+ const accountLabelsValue = computed(() => accountLabels.value);
+-
+ const uiFlags = useMapGetter('contactConversations/getUIFlags');
++
+ const isFetching = computed(() => uiFlags.value.isFetching);
+ 
+ const contactConversations = computed(() =>
+   conversations.value(route.params.contactId)
+ );
++
++const page = ref(1);
++
++const loadMoreConversations = async () => {
++  if (isFetching.value) {
++    return;
++  }
++  const { contactId } = route.params;
++  if (!contactId) {
++    return;
++  }
++  page.value += 1;
++  store.dispatch('contactConversations/get', { contactId, page: page.value });
++};
++
++const hasMore = computed(() => {
++  const currentCount = contactConversations.value.length;
++  // If we have less than 10 (page size) * page, we reached the end
++  // But since we can't reliably know total count, we can check if the current length is a multiple of 10
++  // A better approach in this codebase usually involves checking if the last fetch returned < page size
++  // For now, assuming if we have conversations and not fetching, we can try to load more
++  // Or simply rely on the fact that if we scroll down we trigger it.
++  // Let's rely on checking if we have at least page * 10 items? No, that breaks if items are added.
++  // Best check: if the total count < page * 10, then we probably exhausted it.
++  // However, contactConversations is a getter that might not reflect exact server state if we use push.
++  // A simple heuristic: if return count < 10, stop. But we don't have access to last fetch count here directly.
++  // We can just try to fetch.
++  return isFetching.value || currentCount >= page.value * 10;
++});
+ </script>
+ 
+ <template>
+   <div
+-    v-if="isFetching"
++    v-if="isFetching && !contactConversations.length"
+     class="flex items-center justify-center py-10 text-n-slate-11"
+   >
+     <Spinner />
+@@ -47,6 +78,19 @@ const contactConversations = computed(() =>
+       :account-labels="accountLabelsValue"
+       class="rounded-none hover:rounded-xl hover:bg-n-alpha-1 dark:hover:bg-n-alpha-3"
+     />
++    <div v-if="hasMore" class="flex flex-col items-center justify-center py-4 gap-2">
++      <Spinner v-if="isFetching" />
++      <IntersectionObserver
++        class="w-full h-20"
++        @observed="loadMoreConversations"
++      />
++    </div>
++    <p
++      v-else
++      class="py-4 text-xs text-center text-n-slate-9 dark:text-n-slate-8"
++    >
++      {{ t('CONTACTS_LAYOUT.SIDEBAR.HISTORY.END_OF_HISTORY') }}
++    </p>
+   </div>
+   <p v-else class="px-6 py-10 text-sm leading-6 text-center text-n-slate-11">
+     {{ t('CONTACTS_LAYOUT.SIDEBAR.HISTORY.EMPTY_STATE') }}
+diff --git a/app/javascript/dashboard/components-next/Conversation/ConversationCard/ConversationCard.vue b/app/javascript/dashboard/components-next/Conversation/ConversationCard/ConversationCard.vue
+index f9a2507a1..849a9873e 100644
+--- a/app/javascript/dashboard/components-next/Conversation/ConversationCard/ConversationCard.vue
++++ b/app/javascript/dashboard/components-next/Conversation/ConversationCard/ConversationCard.vue
+@@ -37,10 +37,10 @@ const cardMessagePreviewWithMetaRef = ref(null);
+ 
+ const currentContact = computed(() => props.contact);
+ 
+-const currentContactName = computed(() => currentContact.value?.name);
+-const currentContactThumbnail = computed(() => currentContact.value?.thumbnail);
++const currentContactName = computed(() => currentContact.value?.name || '');
++const currentContactThumbnail = computed(() => currentContact.value?.thumbnail || '');
+ const currentContactStatus = computed(
+-  () => currentContact.value?.availabilityStatus
++  () => currentContact.value?.availabilityStatus || ''
+ );
+ 
+ const inbox = computed(() => props.stateInbox);
+diff --git a/app/javascript/dashboard/components/IntersectionObserver.vue b/app/javascript/dashboard/components/IntersectionObserver.vue
+index c650a8c0e..3d83cc22b 100644
+--- a/app/javascript/dashboard/components/IntersectionObserver.vue
++++ b/app/javascript/dashboard/components/IntersectionObserver.vue
+@@ -1,26 +1,35 @@
++
+ <script setup>
+-import { ref, defineEmits } from 'vue';
+-import { useIntersectionObserver } from '@vueuse/core';
++import { ref, onMounted, onUnmounted, defineEmits } from 'vue';
+ 
+-const { options } = defineProps({
++const props = defineProps({
+   options: {
+     type: Object,
+-    default: () => ({ root: document, rootMargin: '100px 0 100px 0)' }),
++    default: () => ({ root: null, rootMargin: '100px 0px 100px 0px' }),
+   },
+ });
+ 
+ const emit = defineEmits(['observed']);
+-const observedElement = ref('');
++const observer = ref(null);
++const observedElement = ref(null);
+ 
+-useIntersectionObserver(
+-  observedElement,
+-  ([{ isIntersecting }]) => {
+-    if (isIntersecting) {
++onMounted(() => {
++  observer.value = new IntersectionObserver(([entry]) => {
++    if (entry && entry.isIntersecting) {
+       emit('observed');
+     }
+-  },
+-  options
+-);
++  }, props.options);
++
++  if (observedElement.value) {
++    observer.value.observe(observedElement.value);
++  }
++});
++
++onUnmounted(() => {
++  if (observer.value) {
++    observer.value.disconnect();
++  }
++});
+ </script>
+ 
+ <template>
+diff --git a/app/javascript/dashboard/i18n/locale/en/contact.json b/app/javascript/dashboard/i18n/locale/en/contact.json
+index 32b37de55..fbd694543 100644
+--- a/app/javascript/dashboard/i18n/locale/en/contact.json
++++ b/app/javascript/dashboard/i18n/locale/en/contact.json
+@@ -507,7 +507,8 @@
+         "MERGE": "Merge"
+       },
+       "HISTORY": {
+-        "EMPTY_STATE": "There are no previous conversations associated to this contact"
++        "EMPTY_STATE": "There are no previous conversations associated to this contact",
++        "END_OF_HISTORY": "End of history"
+       },
+       "ATTRIBUTES": {
+         "SEARCH_PLACEHOLDER": "Search for attributes",
+diff --git a/app/javascript/dashboard/i18n/locale/pt_BR/contact.json b/app/javascript/dashboard/i18n/locale/pt_BR/contact.json
+index 2020e5a6d..55a4c3155 100644
+--- a/app/javascript/dashboard/i18n/locale/pt_BR/contact.json
++++ b/app/javascript/dashboard/i18n/locale/pt_BR/contact.json
+@@ -506,7 +506,8 @@
+         "MERGE": "Mesclar"
+       },
+       "HISTORY": {
+-        "EMPTY_STATE": "Não há conversas anteriores associadas a este contato"
++        "EMPTY_STATE": "Não há conversas anteriores associadas a este contato",
++        "END_OF_HISTORY": "Fim do histórico"
+       },
+       "ATTRIBUTES": {
+         "SEARCH_PLACEHOLDER": "Pesquisar atributos",
+diff --git a/app/javascript/dashboard/routes/dashboard/contacts/pages/ContactManageView.vue b/app/javascript/dashboard/routes/dashboard/contacts/pages/ContactManageView.vue
+index 8497f349a..3b4a5fce5 100644
+--- a/app/javascript/dashboard/routes/dashboard/contacts/pages/ContactManageView.vue
++++ b/app/javascript/dashboard/routes/dashboard/contacts/pages/ContactManageView.vue
+@@ -83,7 +83,7 @@ const fetchContactNotes = () => {
+ 
+ const fetchContactConversations = () => {
+   const { contactId } = route.params;
+-  if (contactId) store.dispatch('contactConversations/get', contactId);
++  if (contactId) store.dispatch('contactConversations/get', { contactId });
+ };
+ 
+ const fetchAttributes = () => {
+diff --git a/app/javascript/dashboard/routes/dashboard/conversation/ContactConversations.vue b/app/javascript/dashboard/routes/dashboard/conversation/ContactConversations.vue
+index 734950f69..9bdb7cd19 100644
+--- a/app/javascript/dashboard/routes/dashboard/conversation/ContactConversations.vue
++++ b/app/javascript/dashboard/routes/dashboard/conversation/ContactConversations.vue
+@@ -36,12 +36,16 @@ export default {
+   watch: {
+     contactId(newContactId, prevContactId) {
+       if (newContactId && newContactId !== prevContactId) {
+-        this.$store.dispatch('contactConversations/get', newContactId);
++        this.$store.dispatch('contactConversations/get', {
++          contactId: newContactId,
++        });
+       }
+     },
+   },
+   mounted() {
+-    this.$store.dispatch('contactConversations/get', this.contactId);
++    this.$store.dispatch('contactConversations/get', {
++      contactId: this.contactId,
++    });
+   },
+ };
+ </script>
+diff --git a/app/javascript/dashboard/store/modules/contactConversations.js b/app/javascript/dashboard/store/modules/contactConversations.js
+index 8e631ae00..7b330507b 100644
+--- a/app/javascript/dashboard/store/modules/contactConversations.js
++++ b/app/javascript/dashboard/store/modules/contactConversations.js
+@@ -110,16 +110,23 @@ export const actions = {
+       });
+     }
+   },
+-  get: async ({ commit }, contactId) => {
++  get: async ({ commit }, { contactId, page = 1 }) => {
+     commit(types.default.SET_CONTACT_CONVERSATIONS_UI_FLAG, {
+       isFetching: true,
+     });
+     try {
+-      const response = await ContactAPI.getConversations(contactId);
+-      commit(types.default.SET_CONTACT_CONVERSATIONS, {
+-        id: contactId,
+-        data: response.data.payload,
+-      });
++      const response = await ContactAPI.getConversations(contactId, page);
++      if (page === 1) {
++        commit(types.default.SET_CONTACT_CONVERSATIONS, {
++          id: contactId,
++          data: response.data.payload,
++        });
++      } else {
++        commit(types.default.APPEND_CONTACT_CONVERSATIONS, {
++          id: contactId,
++          data: response.data.payload,
++        });
++      }
+       commit(types.default.SET_CONTACT_CONVERSATIONS_UI_FLAG, {
+         isFetching: false,
+       });
+@@ -144,6 +151,13 @@ export const mutations = {
+       [id]: data,
+     };
+   },
++  [types.default.APPEND_CONTACT_CONVERSATIONS]: ($state, { id, data }) => {
++    const conversations = $state.records[id] || [];
++    $state.records = {
++      ...$state.records,
++      [id]: [...conversations, ...data],
++    };
++  },
+   [types.default.ADD_CONTACT_CONVERSATION]: ($state, { id, data }) => {
+     const conversations = $state.records[id] || [];
+ 
+diff --git a/app/javascript/dashboard/store/mutation-types.js b/app/javascript/dashboard/store/mutation-types.js
+index 48e6babdc..c81438fbf 100644
+--- a/app/javascript/dashboard/store/mutation-types.js
++++ b/app/javascript/dashboard/store/mutation-types.js
+@@ -170,6 +170,7 @@ export default {
+   // Contact Conversation
+   SET_CONTACT_CONVERSATIONS_UI_FLAG: 'SET_CONTACT_CONVERSATIONS_UI_FLAG',
+   SET_CONTACT_CONVERSATIONS: 'SET_CONTACT_CONVERSATIONS',
++  APPEND_CONTACT_CONVERSATIONS: 'APPEND_CONTACT_CONVERSATIONS',
+   ADD_CONTACT_CONVERSATION: 'ADD_CONTACT_CONVERSATION',
+   DELETE_CONTACT_CONVERSATION: 'DELETE_CONTACT_CONVERSATION',
+ 
+diff --git a/spec/controllers/api/v1/accounts/contacts/conversations_controller_spec.rb b/spec/controllers/api/v1/accounts/contacts/conversations_controller_spec.rb
+index da7764d25..b23be14a9 100644
+--- a/spec/controllers/api/v1/accounts/contacts/conversations_controller_spec.rb
++++ b/spec/controllers/api/v1/accounts/contacts/conversations_controller_spec.rb
+@@ -61,5 +61,19 @@ RSpec.describe '/api/v1/accounts/{account.id}/contacts/:id/conversations', type:
+         end
+       end
+     end
++
++    context 'pagination' do
++      before do
++        create_list(:conversation, 15, account: account, inbox: inbox_1, contact: contact, contact_inbox: contact_inbox_1)
++      end
++
++      it 'returns paginated conversations' do
++        get "/api/v1/accounts/#{account.id}/contacts/#{contact.id}/conversations?page=1", headers: admin.create_new_auth_token
++
++        expect(response).to have_http_status(:success)
++        json_response = response.parsed_body
++        expect(json_response['payload'].length).to eq 10
++      end
++    end
+   end
+ end

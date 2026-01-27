@@ -1,0 +1,13 @@
+diff --git a/app/models/message.rb b/app/models/message.rb
+index 0bf7a176b..d331a3b54 100644
+--- a/app/models/message.rb
++++ b/app/models/message.rb
+@@ -381,7 +381,7 @@ class Message < ApplicationRecord
+       conversation.pending!
+     elsif conversation.inbox.api?
+       Current.executed_by = sender if reopened_by_contact?
+-      conversation.open!
++      # conversation.open!
+     else
+       conversation.open!
+     end

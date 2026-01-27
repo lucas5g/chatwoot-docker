@@ -1,0 +1,260 @@
+diff --git a/app/javascript/dashboard/components/buttons/ResolveAction.vue b/app/javascript/dashboard/components/buttons/ResolveAction.vue
+index c1700321a..b95ca628c 100644
+--- a/app/javascript/dashboard/components/buttons/ResolveAction.vue
++++ b/app/javascript/dashboard/components/buttons/ResolveAction.vue
+@@ -31,6 +31,16 @@ const openDropdown = () => toggleDropdown(true);
+ 
+ const currentChat = computed(() => getters.getSelectedChat.value);
+ 
++const savedLabels = computed(() => {
++  return (
++    store.getters['conversationLabels/getConversationLabels'](
++      currentChat.value.id
++    ) || []
++  );
++});
++
++const hasLabels = computed(() => savedLabels.value.length > 0);
++
+ const isOpen = computed(
+   () => currentChat.value.status === wootConstants.STATUS_TYPE.OPEN
+ );
+@@ -78,9 +88,14 @@ const openSnoozeModal = () => {
+ };
+ 
+ const toggleStatus = (status, snoozedUntil) => {
++  if (status === wootConstants.STATUS_TYPE.RESOLVED && !hasLabels.value) {
++    useAlert(t('CONVERSATION.HEADER.RESOLVE_ACTION_DISABLED_HINT'));
++    return Promise.resolve();
++  }
++
+   closeDropdown();
+   isLoading.value = true;
+-  store
++  return store
+     .dispatch('toggleStatus', {
+       conversationId: currentChat.value.id,
+       status,
+@@ -107,19 +122,23 @@ const keyboardEvents = {
+   },
+   'Alt+KeyE': {
+     action: async () => {
+-      await toggleStatus(wootConstants.STATUS_TYPE.RESOLVED);
++      if (hasLabels.value) {
++        await toggleStatus(wootConstants.STATUS_TYPE.RESOLVED);
++      }
+     },
+   },
+   '$mod+Alt+KeyE': {
+     action: async event => {
+-      const { all, activeIndex, lastIndex } = getConversationParams();
+-      await toggleStatus(wootConstants.STATUS_TYPE.RESOLVED);
+-
+-      if (activeIndex < lastIndex) {
+-        all[activeIndex + 1].click();
+-      } else if (all.length > 1) {
+-        all[0].click();
+-        document.querySelector('.conversations-list').scrollTop = 0;
++      if (hasLabels.value) {
++        const { all, activeIndex, lastIndex } = getConversationParams();
++        await toggleStatus(wootConstants.STATUS_TYPE.RESOLVED);
++
++        if (activeIndex < lastIndex) {
++          all[activeIndex + 1].click();
++        } else if (all.length > 1) {
++          all[0].click();
++          document.querySelector('.conversations-list').scrollTop = 0;
++        }
+       }
+       event.preventDefault();
+     },
+@@ -140,12 +159,16 @@ useEmitter(CMD_RESOLVE_CONVERSATION, onCmdResolveConversation);
+     >
+       <Button
+         v-if="isOpen"
++        v-tooltip.top-end="
++          !hasLabels ? t('CONVERSATION.HEADER.RESOLVE_ACTION_DISABLED_HINT') : ''
++        "
+         :label="t('CONVERSATION.HEADER.RESOLVE_ACTION')"
+         size="sm"
+         color="slate"
+         no-animation
+         class="ltr:rounded-r-none rtl:rounded-l-none !outline-0"
+         :is-loading="isLoading"
++        :disabled="!hasLabels"
+         @click="onCmdResolveConversation"
+       />
+       <Button
+diff --git a/app/javascript/dashboard/components/widgets/conversation/ConversationCard.vue b/app/javascript/dashboard/components/widgets/conversation/ConversationCard.vue
+index 1040ff1af..0d2b57799 100644
+--- a/app/javascript/dashboard/components/widgets/conversation/ConversationCard.vue
++++ b/app/javascript/dashboard/components/widgets/conversation/ConversationCard.vue
+@@ -382,6 +382,7 @@ const deleteConversation = () => {
+         :has-unread-messages="hasUnread"
+         :conversation-url="conversationPath"
+         :allowed-options="allowedContextMenuOptions"
++        :labels="chat.labels"
+         @update-conversation="onUpdateConversation"
+         @assign-agent="onAssignAgent"
+         @assign-label="onAssignLabel"
+diff --git a/app/javascript/dashboard/components/widgets/conversation/contextMenu/Index.vue b/app/javascript/dashboard/components/widgets/conversation/contextMenu/Index.vue
+index a6f79500a..fc47722d6 100644
+--- a/app/javascript/dashboard/components/widgets/conversation/contextMenu/Index.vue
++++ b/app/javascript/dashboard/components/widgets/conversation/contextMenu/Index.vue
+@@ -91,23 +91,7 @@ export default {
+         label: this.$t('CONVERSATION.CARD_CONTEXT_MENU.MARK_AS_UNREAD'),
+         icon: 'mail-unread',
+       },
+-      statusMenuConfig: [
+-        {
+-          key: wootConstants.STATUS_TYPE.RESOLVED,
+-          label: this.$t('CONVERSATION.CARD_CONTEXT_MENU.RESOLVED'),
+-          icon: 'checkmark',
+-        },
+-        {
+-          key: wootConstants.STATUS_TYPE.OPEN,
+-          label: this.$t('CONVERSATION.CARD_CONTEXT_MENU.REOPEN'),
+-          icon: 'arrow-redo',
+-        },
+-        {
+-          key: wootConstants.STATUS_TYPE.PENDING,
+-          label: this.$t('CONVERSATION.CARD_CONTEXT_MENU.PENDING'),
+-          icon: 'book-clock',
+-        },
+-      ],
++
+       snoozeOption: {
+         key: wootConstants.STATUS_TYPE.SNOOZED,
+         label: this.$t('CONVERSATION.CARD_CONTEXT_MENU.SNOOZE.TITLE'),
+@@ -179,6 +163,7 @@ export default {
+       assignableAgentsUiFlags: 'inboxAssignableAgents/getUIFlags',
+       currentUser: 'getCurrentUser',
+       currentAccountId: 'getCurrentAccountId',
++      getConversationLabels: 'conversationLabels/getConversationLabels',
+     }),
+     filteredAgentOnAvailability() {
+       const agents = this.$store.getters[
+@@ -211,6 +196,32 @@ export default {
+       // Don't show snooze if the conversation is already snoozed/resolved/pending
+       return this.status === wootConstants.STATUS_TYPE.OPEN;
+     },
++    hasLabels() {
++      return (this.getConversationLabels(this.chatId) || []).length > 0;
++    },
++    statusMenuConfig() {
++      return [
++        {
++          key: wootConstants.STATUS_TYPE.RESOLVED,
++          label: this.$t('CONVERSATION.CARD_CONTEXT_MENU.RESOLVED'),
++          icon: 'checkmark',
++          disabled: !this.hasLabels,
++          tooltip: !this.hasLabels
++            ? this.$t('CONVERSATION.HEADER.RESOLVE_ACTION_DISABLED_HINT')
++            : '',
++        },
++        {
++          key: wootConstants.STATUS_TYPE.OPEN,
++          label: this.$t('CONVERSATION.CARD_CONTEXT_MENU.REOPEN'),
++          icon: 'arrow-redo',
++        },
++        {
++          key: wootConstants.STATUS_TYPE.PENDING,
++          label: this.$t('CONVERSATION.CARD_CONTEXT_MENU.PENDING'),
++          icon: 'book-clock',
++        },
++      ];
++    },
+   },
+   mounted() {
+     this.$store.dispatch('inboxAssignableAgents/fetch', [this.inboxId]);
+@@ -298,9 +309,11 @@ export default {
+         <MenuItem
+           v-if="show(option.key) && isAllowed([MENU.STATUS])"
+           :key="option.key"
++          v-tooltip.left="option.tooltip"
+           :option="option"
++          :disabled="option.disabled"
+           variant="icon"
+-          @click.stop="toggleStatus(option.key, null)"
++          @click.stop="!option.disabled && toggleStatus(option.key, null)"
+         />
+       </template>
+       <MenuItem
+diff --git a/app/javascript/dashboard/components/widgets/conversation/contextMenu/menuItem.vue b/app/javascript/dashboard/components/widgets/conversation/contextMenu/menuItem.vue
+index 9b1c9b0fb..a3ebeea56 100644
+--- a/app/javascript/dashboard/components/widgets/conversation/contextMenu/menuItem.vue
++++ b/app/javascript/dashboard/components/widgets/conversation/contextMenu/menuItem.vue
+@@ -10,11 +10,19 @@ defineProps({
+     type: String,
+     default: 'default',
+   },
++  disabled: {
++    type: Boolean,
++    default: false,
++  },
+ });
+ </script>
+ 
+ <template>
+-  <div class="menu text-n-slate-12 min-h-7 min-w-0" role="button">
++  <div
++    class="menu text-n-slate-12 min-h-7 min-w-0"
++    role="button"
++    :class="{ disabled }"
++  >
+     <fluent-icon
+       v-if="variant === 'icon' && option.icon"
+       :icon="option.icon"
+@@ -52,6 +60,14 @@ defineProps({
+   &:hover {
+     @apply bg-n-brand text-white;
+   }
++
++  &.disabled {
++    @apply opacity-50 cursor-not-allowed;
++
++    &:hover {
++      @apply bg-transparent text-n-slate-12;
++    }
++  }
+ }
+ 
+ .agent-thumbnail {
+diff --git a/app/javascript/dashboard/i18n/locale/en/conversation.json b/app/javascript/dashboard/i18n/locale/en/conversation.json
+index ec355e412..cd2ae028c 100644
+--- a/app/javascript/dashboard/i18n/locale/en/conversation.json
++++ b/app/javascript/dashboard/i18n/locale/en/conversation.json
+@@ -95,6 +95,7 @@
+       "SNOOZED_UNTIL_TOMORROW": "Snoozed until tomorrow",
+       "SNOOZED_UNTIL_NEXT_WEEK": "Snoozed until next week",
+       "SNOOZED_UNTIL_NEXT_REPLY": "Snoozed until next reply",
++      "RESOLVE_ACTION_DISABLED_HINT": "Add a label to resolve",
+       "SLA_STATUS": {
+         "FRT": "FRT {status}",
+         "NRT": "NRT {status}",
+@@ -436,4 +437,4 @@
+   "GALLERY_VIEW": {
+     "ERROR_DOWNLOADING": "Unable to download attachment. Please try again"
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json b/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
+index b77f4e3f6..4760ca7d8 100644
+--- a/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
++++ b/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
+@@ -95,6 +95,7 @@
+       "SNOOZED_UNTIL_TOMORROW": "Adiado até amanhã",
+       "SNOOZED_UNTIL_NEXT_WEEK": "Adiada até a próxima semana",
+       "SNOOZED_UNTIL_NEXT_REPLY": "Adiado até a próxima resposta",
++      "RESOLVE_ACTION_DISABLED_HINT": "Adicione uma etiqueta para resolver",
+       "SLA_STATUS": {
+         "FRT": "FRT {status}",
+         "NRT": "NRT {status}",
+@@ -426,4 +427,4 @@
+   "GALLERY_VIEW": {
+     "ERROR_DOWNLOADING": "Não foi possível baixar o anexo. Por favor, tente novamente"
+   }
+-}
++}
+\ No newline at end of file
