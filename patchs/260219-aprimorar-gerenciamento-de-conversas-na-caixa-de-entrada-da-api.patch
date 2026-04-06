@@ -1,0 +1,66 @@
+diff --git a/app/javascript/dashboard/routes/dashboard/settings/account/components/BuildInfo.vue b/app/javascript/dashboard/routes/dashboard/settings/account/components/BuildInfo.vue
+index d86273545..f26368119 100644
+--- a/app/javascript/dashboard/routes/dashboard/settings/account/components/BuildInfo.vue
++++ b/app/javascript/dashboard/routes/dashboard/settings/account/components/BuildInfo.vue
+@@ -51,7 +51,7 @@ const copyGitSha = () => {
+       >
+         {{ `Build ${gitSha}` }}
+       </span>
+-      <span class="px-2">19/02/26 17:12</span>
++      <span class="px-2">27/01/26 13:59</span>
+     </div>
+   </div>
+ </template>
+diff --git a/app/models/message.rb b/app/models/message.rb
+index 58a35d1be..d331a3b54 100644
+--- a/app/models/message.rb
++++ b/app/models/message.rb
+@@ -66,7 +66,6 @@ class Message < ApplicationRecord
+   before_validation :prevent_message_flooding
+   before_save :ensure_processed_message_content
+   before_save :ensure_in_reply_to
+-  before_create :ensure_active_conversation_for_api
+ 
+   validates :account_id, presence: true
+   validates :inbox_id, presence: true
+@@ -382,7 +381,7 @@ class Message < ApplicationRecord
+       conversation.pending!
+     elsif conversation.inbox.api?
+       Current.executed_by = sender if reopened_by_contact?
+-      conversation.open!
++      # conversation.open!
+     else
+       conversation.open!
+     end
+@@ -409,31 +408,6 @@ class Message < ApplicationRecord
+   def reindex_for_search
+     reindex(mode: :async)
+   end
+-
+-  def ensure_active_conversation_for_api
+-    return unless inbox.api?
+-    return if inbox.lock_to_single_conversation?
+-    return unless incoming? && conversation.resolved?
+-
+-    # Check if there is an existing active conversation to prevent multiple conversations
+-    # when messages are sent in a burst
+-    active_conversation = conversation.contact_inbox.conversations
+-                                      .where(status: [:open, :pending])
+-                                      .last
+-
+-    if active_conversation
+-      self.conversation = active_conversation
+-    else
+-      new_conversation = Conversation.create!(
+-        account_id: account_id,
+-        inbox_id: inbox_id,
+-        contact_id: conversation.contact_id,
+-        contact_inbox_id: conversation.contact_inbox_id,
+-        status: :open
+-      )
+-      self.conversation = new_conversation
+-    end
+-  end
+ end
+ 
+ Message.prepend_mod_with('Message')
