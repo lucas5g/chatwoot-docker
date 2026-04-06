@@ -1,0 +1,143 @@
+diff --git a/app/controllers/api/v1/accounts/conversations/messages_controller.rb b/app/controllers/api/v1/accounts/conversations/messages_controller.rb
+index 67381a715..341ccf323 100644
+--- a/app/controllers/api/v1/accounts/conversations/messages_controller.rb
++++ b/app/controllers/api/v1/accounts/conversations/messages_controller.rb
+@@ -1,5 +1,6 @@
+ class Api::V1::Accounts::Conversations::MessagesController < Api::V1::Accounts::Conversations::BaseController
+   before_action :ensure_api_inbox, only: :update
++  before_action :authorize_reply, only: :create
+ 
+   def index
+     @messages = message_finder.perform
+@@ -56,6 +57,12 @@ class Api::V1::Accounts::Conversations::MessagesController < Api::V1::Accounts::
+ 
+   private
+ 
++  def authorize_reply
++    return if params[:private].present? && params[:private].to_s == 'true'
++
++    authorize @conversation, :reply?
++  end
++
+   def message
+     @message ||= @conversation.messages.find(permitted_params[:id])
+   end
+diff --git a/app/javascript/dashboard/components/widgets/WootWriter/Editor.vue b/app/javascript/dashboard/components/widgets/WootWriter/Editor.vue
+index 2a9577644..bffec021f 100644
+--- a/app/javascript/dashboard/components/widgets/WootWriter/Editor.vue
++++ b/app/javascript/dashboard/components/widgets/WootWriter/Editor.vue
+@@ -804,6 +804,13 @@ watch(
+   }
+ );
+ 
++watch(
++  computed(() => props.placeholder),
++  () => {
++    reloadState(props.modelValue);
++  }
++);
++
+ watch(sendWithSignature, newValue => {
+   // see if the allowSignature flag is true
+   if (props.allowSignature) {
+diff --git a/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue b/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue
+index 71762a007..bae081b48 100644
+--- a/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue
++++ b/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue
+@@ -202,6 +202,10 @@ export default {
+       return this.$store.getters['inboxes/getInbox'](this.inboxId);
+     },
+     messagePlaceHolder() {
++      if (this.isAgentRestricted) {
++        return this.$t('CONVERSATION.FOOTER.AGENT_NOT_ASSIGNED_RESTRICTION');
++      }
++
+       if (this.isEditorDisabled) {
+         if (this.isAWhatsAppChannel) {
+           return this.$t('CONVERSATION.FOOTER.MESSAGING_RESTRICTED_WHATSAPP');
+@@ -433,11 +437,20 @@ export default {
+     isDefaultEditorMode() {
+       return !this.showAudioRecorderEditor && !this.copilot.isActive.value;
+     },
++    isAgentRestricted() {
++      const assignee = this.currentChat?.meta?.assignee;
++      const isAdmin = this.currentUser?.role === 'administrator';
++
++      if (isAdmin || this.isOnPrivateNote) return false;
++
++      return !assignee || assignee.id !== this.currentUser?.id;
++    },
+     isEditorDisabled() {
+       return (
+-        (this.isAWhatsAppChannel || this.isAPIInbox) &&
+-        !this.isOnPrivateNote &&
+-        !this.currentChat.can_reply
++        this.isAgentRestricted ||
++        ((this.isAWhatsAppChannel || this.isAPIInbox) &&
++          !this.isOnPrivateNote &&
++          !this.currentChat.can_reply)
+       );
+     },
+     isConversationOpen() {
+@@ -1249,7 +1262,11 @@ export default {
+ 
+ <template>
+   <ReplyBoxBanner :message="message" :is-on-private-note="isOnPrivateNote" />
+-  <div ref="replyEditor" class="reply-box" :class="replyBoxClass">
++  <div
++    ref="replyEditor"
++    class="reply-box"
++    :class="[replyBoxClass, { 'cursor-not-allowed': isEditorDisabled }]"
++  >
+     <ReplyTopPanel
+       :mode="replyType"
+       :conversation-id="conversationId"
+@@ -1333,6 +1350,7 @@ export default {
+           :conversation-id="conversationId"
+           :editor-id="editorStateId"
+           class="input popover-prosemirror-menu"
++          :class="{ 'pointer-events-none': isEditorDisabled }"
+           :is-private="isOnPrivateNote"
+           :placeholder="messagePlaceHolder"
+           :update-selection-with="updateEditorSelectionWith"
+diff --git a/app/javascript/dashboard/i18n/locale/en/conversation.json b/app/javascript/dashboard/i18n/locale/en/conversation.json
+index fcbed56ac..e3a623031 100644
+--- a/app/javascript/dashboard/i18n/locale/en/conversation.json
++++ b/app/javascript/dashboard/i18n/locale/en/conversation.json
+@@ -197,7 +197,8 @@
+       "MESSAGE_SIGNATURE_NOT_CONFIGURED": "Message signature is not configured, please configure it in profile settings.",
+       "COPILOT_MSG_INPUT": "Give copilot additional prompts, or ask anything else... Press enter to send follow-up",
+       "CLICK_HERE": "Click here to update",
+-      "WHATSAPP_TEMPLATES": "Whatsapp Templates"
++      "WHATSAPP_TEMPLATES": "Whatsapp Templates",
++      "AGENT_NOT_ASSIGNED_RESTRICTION": "You can only send messages in conversations assigned to you. Use private notes to communicate internally."
+     },
+     "REPLYBOX": {
+       "REPLY": "Reply",
+diff --git a/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json b/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
+index ed3b0e844..123320d70 100644
+--- a/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
++++ b/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
+@@ -197,7 +197,8 @@
+       "MESSAGE_SIGNATURE_NOT_CONFIGURED": "A assinatura da mensagem não está configurada. Por favor, configure-a nas configurações do perfil.",
+       "COPILOT_MSG_INPUT": "Forneça instruções adicionais ao Copiloto ou pergunte algo mais... Pressione Enter para enviar",
+       "CLICK_HERE": "Clique aqui para atualizar",
+-      "WHATSAPP_TEMPLATES": "Modelos do Whatsapp"
++      "WHATSAPP_TEMPLATES": "Modelos do Whatsapp",
++      "AGENT_NOT_ASSIGNED_RESTRICTION": "Você só pode enviar mensagens em conversas atribuídas a você. Use notas privadas para comunicação interna."
+     },
+     "REPLYBOX": {
+       "REPLY": "Responder",
+diff --git a/app/policies/conversation_policy.rb b/app/policies/conversation_policy.rb
+index d23f29e54..ae277f992 100644
+--- a/app/policies/conversation_policy.rb
++++ b/app/policies/conversation_policy.rb
+@@ -1,4 +1,8 @@
+ class ConversationPolicy < ApplicationPolicy
++  def reply?
++    administrator? || agent_bot? || assigned_to_user?
++  end
++
+   def index?
+     true
+   end
