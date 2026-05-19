@@ -1,0 +1,249 @@
+diff --git a/lib/safe_fetch.rb b/lib/safe_fetch.rb
+index 7f89c03c4..0b8ae8dfc 100644
+--- a/lib/safe_fetch.rb
++++ b/lib/safe_fetch.rb
+@@ -1,4 +1,5 @@
+ require 'ssrf_filter'
++require 'ipaddr'
+ 
+ module SafeFetch
+   DEFAULT_ALLOWED_CONTENT_TYPE_PREFIXES = %w[image/ video/].freeze
+diff --git a/lib/safe_fetch/fetcher.rb b/lib/safe_fetch/fetcher.rb
+index fa3c01f55..4318eb464 100644
+--- a/lib/safe_fetch/fetcher.rb
++++ b/lib/safe_fetch/fetcher.rb
+@@ -32,7 +32,8 @@ class SafeFetch::Fetcher
+     response = nil
+     bytes_written = 0
+ 
+-    SsrfFilter.public_send(options.method, options.url, **options.request_options) do |res|
++    request = allowed_private_ip_url? ? private_ip_request : ssrf_filter_request
++    request.call do |res|
+       response = res
+       next unless res.is_a?(Net::HTTPSuccess)
+ 
+@@ -43,6 +44,74 @@ class SafeFetch::Fetcher
+     response
+   end
+ 
++  def ssrf_filter_request
++    proc { |&block| SsrfFilter.public_send(options.method, options.url, **options.request_options, &block) }
++  end
++
++  def private_ip_request
++    proc do |&block|
++      http = Net::HTTP.new(resolved_ip_addresses.first, options.uri.port)
++      http.use_ssl = options.uri.scheme == 'https'
++      http.open_timeout = options.open_timeout
++      http.read_timeout = options.read_timeout
++      http.request(net_http_request, &block)
++    end
++  end
++
++  def net_http_request
++    request = net_http_request_class.new(options.uri)
++    request['Host'] ||= host_header
++    options.headers&.each { |key, value| request[key] = value }
++    request.body = options.body if options.body.present?
++
++    credentials = options.http_basic_authentication.presence || uri_basic_authentication(options.uri)
++    request.basic_auth(*credentials) if credentials.present?
++    request
++  end
++
++  def net_http_request_class
++    {
++      delete: Net::HTTP::Delete,
++      get: Net::HTTP::Get,
++      head: Net::HTTP::Head,
++      patch: Net::HTTP::Patch,
++      post: Net::HTTP::Post,
++      put: Net::HTTP::Put
++    }.fetch(options.method)
++  end
++
++  def host_header
++    return options.uri.host if options.uri.port == options.uri.default_port
++
++    "#{options.uri.host}:#{options.uri.port}"
++  end
++
++  def allowed_private_ip_url?
++    return false if options.allow_private_ip_ranges.blank?
++
++    resolved_ip_addresses.present? && resolved_ip_addresses.all? do |address|
++      options.allow_private_ip_ranges.any? { |range| range.include?(IPAddr.new(address)) }
++    end
++  end
++
++  def resolved_ip_addresses
++    @resolved_ip_addresses ||= begin
++      IPAddr.new(options.uri.hostname)
++      [options.uri.hostname]
++    rescue IPAddr::InvalidAddressError
++      Resolv.getaddresses(options.uri.hostname)
++    end
++  end
++
++  def uri_basic_authentication(value)
++    return if value.user.blank?
++
++    [
++      URI.decode_uri_component(value.user),
++      URI.decode_uri_component(value.password.to_s)
++    ]
++  end
++
+   def validate_content_type!(content_type)
+     return unless options.validate_content_type?
+     return if allowed_content_type?(content_type)
+diff --git a/lib/safe_fetch/request_options.rb b/lib/safe_fetch/request_options.rb
+index 72969a76d..e7b5198f6 100644
+--- a/lib/safe_fetch/request_options.rb
++++ b/lib/safe_fetch/request_options.rb
+@@ -9,11 +9,12 @@ class SafeFetch::RequestOptions
+     http_basic_authentication: nil,
+     allowed_content_type_prefixes: SafeFetch::DEFAULT_ALLOWED_CONTENT_TYPE_PREFIXES,
+     allowed_content_types: SafeFetch::DEFAULT_ALLOWED_CONTENT_TYPES,
+-    validate_content_type: true
++    validate_content_type: true,
++    allow_private_ip_ranges: []
+   }.freeze
+ 
+   attr_reader :allowed_content_type_prefixes, :allowed_content_types, :body, :headers,
+-              :http_basic_authentication, :method, :open_timeout, :read_timeout, :uri, :url
++              :allow_private_ip_ranges, :http_basic_authentication, :method, :open_timeout, :read_timeout, :uri, :url
+ 
+   def initialize(url:, **options)
+     config = DEFAULTS.merge(options)
+@@ -29,6 +30,10 @@ class SafeFetch::RequestOptions
+     @allowed_content_type_prefixes = Array(config[:allowed_content_type_prefixes])
+     @allowed_content_types = Array(config[:allowed_content_types])
+     @validate_content_type = config[:validate_content_type]
++    @allow_private_ip_ranges = Array(config[:allow_private_ip_ranges]).filter_map do |range|
++      value = range.to_s.strip
++      IPAddr.new(value) if value.present?
++    end
+   end
+ 
+   def effective_max_bytes
+diff --git a/lib/webhooks/trigger.rb b/lib/webhooks/trigger.rb
+index 57d96f51d..b952c84b3 100644
+--- a/lib/webhooks/trigger.rb
++++ b/lib/webhooks/trigger.rb
+@@ -42,13 +42,27 @@ class Webhooks::Trigger
+     body = @payload.to_json
+     SafeFetch.fetch(
+       @url,
++      **safe_fetch_options(body)
++    ) { |_response| nil }
++  end
++
++  def safe_fetch_options(body)
++    options = {
+       method: :post,
+       body: body,
+       headers: request_headers(body),
+       open_timeout: webhook_timeout,
+       read_timeout: webhook_timeout,
+       validate_content_type: false
+-    ) { |_response| nil }
++    }
++    options[:allow_private_ip_ranges] = allowed_private_ip_ranges if allowed_private_ip_ranges.present?
++    options
++  end
++
++  def allowed_private_ip_ranges
++    return [] unless @webhook_type == :agent_bot_webhook
++
++    (ENV['AGENT_BOT_ALLOWED_PRIVATE_IP_RANGES'].presence || ENV['AGENT_BOT_ALLOWED_PRIVATE_IP_RANGE'].to_s).split(',').map(&:strip)
+   end
+ 
+   def request_headers(body)
+diff --git a/spec/lib/safe_fetch_spec.rb b/spec/lib/safe_fetch_spec.rb
+index 8c54a092c..b4698f2dc 100644
+--- a/spec/lib/safe_fetch_spec.rb
++++ b/spec/lib/safe_fetch_spec.rb
+@@ -205,6 +205,33 @@ RSpec.describe SafeFetch do
+           expect(error.class.name).to eq('SafeFetch::UnsafeUrlError')
+         end
+       end
++
++      it 'allows private IP literals explicitly included in the allowlist' do
++        private_url = 'http://10.230.32.9/image.png'
++        stub_request(:get, private_url).to_return(
++          status: 200,
++          body: File.new(Rails.root.join('spec/assets/avatar.png')),
++          headers: { 'Content-Type' => 'image/png' }
++        )
++
++        described_class.fetch(private_url, allow_private_ip_ranges: ['10.230.32.9/32']) do |result|
++          expect(result.content_type).to eq('image/png')
++        end
++      end
++
++      it 'allows hostnames only when all resolved IPs are included in the allowlist' do
++        private_url = 'http://n8n.internal/image.png'
++        allow(Resolv).to receive(:getaddresses).with('n8n.internal').and_return(['10.230.32.9'])
++        stub_request(:get, private_url).to_return(
++          status: 200,
++          body: File.new(Rails.root.join('spec/assets/avatar.png')),
++          headers: { 'Content-Type' => 'image/png' }
++        )
++
++        described_class.fetch(private_url, allow_private_ip_ranges: ['10.230.0.0/16']) do |result|
++          expect(result.content_type).to eq('image/png')
++        end
++      end
+     end
+ 
+     context 'with content-type allowlist' do
+diff --git a/spec/lib/webhooks/trigger_spec.rb b/spec/lib/webhooks/trigger_spec.rb
+index 1c5ebc16a..a951831b2 100644
+--- a/spec/lib/webhooks/trigger_spec.rb
++++ b/spec/lib/webhooks/trigger_spec.rb
+@@ -163,6 +163,44 @@ describe Webhooks::Trigger do
+         expect(activity_message.message_type).to eq('activity')
+         expect(activity_message.content).to eq(agent_bot_error_content)
+       end
++
++      it 'passes configured private IP ranges to agent bot webhooks' do
++        payload = { event: 'message_created', id: pending_message.id }
++
++        with_modified_env AGENT_BOT_ALLOWED_PRIVATE_IP_RANGES: '10.230.32.9/32' do
++          expect(SafeFetch).to receive(:fetch).with(
++            url,
++            method: :post,
++            body: payload.to_json,
++            headers: base_headers,
++            open_timeout: webhook_timeout,
++            read_timeout: webhook_timeout,
++            validate_content_type: false,
++            allow_private_ip_ranges: ['10.230.32.9/32']
++          ).and_yield(fetch_result)
++
++          trigger.execute(url, payload, webhook_type)
++        end
++      end
++
++      it 'supports the legacy singular private IP range setting' do
++        payload = { event: 'message_created', id: pending_message.id }
++
++        with_modified_env AGENT_BOT_ALLOWED_PRIVATE_IP_RANGE: '10.230.32.9' do
++          expect(SafeFetch).to receive(:fetch).with(
++            url,
++            method: :post,
++            body: payload.to_json,
++            headers: base_headers,
++            open_timeout: webhook_timeout,
++            read_timeout: webhook_timeout,
++            validate_content_type: false,
++            allow_private_ip_ranges: ['10.230.32.9']
++          ).and_yield(fetch_result)
++
++          trigger.execute(url, payload, webhook_type)
++        end
++      end
+     end
+ 
+     it 'handles 500 without raising for non-agent webhooks' do
