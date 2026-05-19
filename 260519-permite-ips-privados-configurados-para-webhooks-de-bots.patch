@@ -1,0 +1,85 @@
+diff --git a/lib/webhooks/trigger.rb b/lib/webhooks/trigger.rb
+index b952c84b3..92c55982f 100644
+--- a/lib/webhooks/trigger.rb
++++ b/lib/webhooks/trigger.rb
+@@ -60,9 +60,21 @@ class Webhooks::Trigger
+   end
+ 
+   def allowed_private_ip_ranges
+-    return [] unless @webhook_type == :agent_bot_webhook
++    common_allowed_private_ip_ranges.presence || webhook_type_allowed_private_ip_ranges
++  end
++
++  def common_allowed_private_ip_ranges
++    private_ip_ranges_from_env('ALLOWED_PRIVATE_IP_RANGES', 'ALLOWED_PRIVATE_IP_RANGE')
++  end
++
++  def webhook_type_allowed_private_ip_ranges
++    return private_ip_ranges_from_env('AGENT_BOT_ALLOWED_PRIVATE_IP_RANGES', 'AGENT_BOT_ALLOWED_PRIVATE_IP_RANGE') if @webhook_type == :agent_bot_webhook
++
++    private_ip_ranges_from_env('WEBHOOK_ALLOWED_PRIVATE_IP_RANGES', 'WEBHOOK_ALLOWED_PRIVATE_IP_RANGE')
++  end
+ 
+-    (ENV['AGENT_BOT_ALLOWED_PRIVATE_IP_RANGES'].presence || ENV['AGENT_BOT_ALLOWED_PRIVATE_IP_RANGE'].to_s).split(',').map(&:strip)
++  def private_ip_ranges_from_env(plural_key, singular_key)
++    (ENV[plural_key].presence || ENV[singular_key].to_s).split(',').map(&:strip)
+   end
+ 
+   def request_headers(body)
+diff --git a/spec/lib/webhooks/trigger_spec.rb b/spec/lib/webhooks/trigger_spec.rb
+index a951831b2..571ec0a53 100644
+--- a/spec/lib/webhooks/trigger_spec.rb
++++ b/spec/lib/webhooks/trigger_spec.rb
+@@ -167,6 +167,25 @@ describe Webhooks::Trigger do
+       it 'passes configured private IP ranges to agent bot webhooks' do
+         payload = { event: 'message_created', id: pending_message.id }
+ 
++        with_modified_env ALLOWED_PRIVATE_IP_RANGES: '10.230.32.9/32' do
++          expect(SafeFetch).to receive(:fetch).with(
++            url,
++            method: :post,
++            body: payload.to_json,
++            headers: base_headers,
++            open_timeout: webhook_timeout,
++            read_timeout: webhook_timeout,
++            validate_content_type: false,
++            allow_private_ip_ranges: ['10.230.32.9/32']
++          ).and_yield(fetch_result)
++
++          trigger.execute(url, payload, webhook_type)
++        end
++      end
++
++      it 'supports agent bot specific private IP ranges' do
++        payload = { event: 'message_created', id: pending_message.id }
++
+         with_modified_env AGENT_BOT_ALLOWED_PRIVATE_IP_RANGES: '10.230.32.9/32' do
+           expect(SafeFetch).to receive(:fetch).with(
+             url,
+@@ -211,6 +230,26 @@ describe Webhooks::Trigger do
+       expect { trigger.execute(url, payload, webhook_type) }.not_to raise_error
+       expect(message.reload.status).to eq('failed')
+     end
++
++    it 'passes configured private IP ranges to regular webhooks' do
++      payload = { event: 'message_created', conversation: { id: conversation.id }, id: message.id }
++
++      with_modified_env ALLOWED_PRIVATE_IP_RANGES: '10.230.32.58' do
++        expect(SafeFetch).to receive(:fetch).with(
++          url,
++          method: :post,
++          body: payload.to_json,
++          headers: base_headers,
++          open_timeout: webhook_timeout,
++          read_timeout: webhook_timeout,
++          validate_content_type: false,
++          allow_private_ip_ranges: ['10.230.32.58']
++        ).and_yield(fetch_result)
++
++        trigger.execute(url, payload, webhook_type)
++      end
++    end
++
+   end
+ 
+   describe 'request headers' do
