@@ -1,0 +1,392 @@
+diff --git a/app/channels/room_channel.rb b/app/channels/room_channel.rb
+index 629078229..54a0e7977 100644
+--- a/app/channels/room_channel.rb
++++ b/app/channels/room_channel.rb
+@@ -14,6 +14,18 @@ class RoomChannel < ApplicationCable::Channel
+     broadcast_presence
+   end
+ 
++  def unsubscribed
++    return if @current_account.blank? || !@current_user.is_a?(User)
++
++    account_user = @current_account.account_users.find_by(user_id: @current_user.id)
++    return if account_user.blank?
++
++    AgentAvailabilitySessions::Tracker.close_for_account_user(
++      account_user: account_user,
++      end_reason: 'websocket_disconnected'
++    )
++  end
++
+   private
+ 
+   def broadcast_presence
+@@ -33,6 +45,7 @@ class RoomChannel < ApplicationCable::Channel
+     return if @current_account.blank?
+ 
+     ::OnlineStatusTracker.update_presence(@current_account.id, @current_user.class.name, @current_user.id)
++    AgentAvailabilitySessions::Tracker.track_presence(account: @current_account, user: @current_user)
+   end
+ 
+   def pubsub_token
+diff --git a/app/controllers/api/v1/profiles_controller.rb b/app/controllers/api/v1/profiles_controller.rb
+index 141253d0d..fce9080d5 100644
+--- a/app/controllers/api/v1/profiles_controller.rb
++++ b/app/controllers/api/v1/profiles_controller.rb
+@@ -29,6 +29,11 @@ class Api::V1::ProfilesController < Api::BaseController
+   end
+ 
+   def set_active_account
++    active_account_user = @user.account_users.order(active_at: :desc).first
++    if active_account_user.present? && active_account_user.account_id != profile_params[:account_id].to_i
++      AgentAvailabilitySessions::Tracker.close_for_account_user(account_user: active_account_user, end_reason: 'account_switched')
++    end
++
+     @user.account_users.find_by(account_id: profile_params[:account_id]).update(active_at: Time.now.utc)
+     head :ok
+   end
+diff --git a/app/controllers/api/v2/accounts/reports_controller.rb b/app/controllers/api/v2/accounts/reports_controller.rb
+index 192b3619c..680b5ba28 100644
+--- a/app/controllers/api/v2/accounts/reports_controller.rb
++++ b/app/controllers/api/v2/accounts/reports_controller.rb
+@@ -87,6 +87,11 @@ class Api::V2::Accounts::ReportsController < Api::V1::Accounts::BaseController
+     render json: builder.build
+   end
+ 
++  def agent_availability
++    builder = V2::Reports::AgentAvailabilityBuilder.new(account: Current.account, params: agent_availability_params)
++    render json: builder.build
++  end
++
+   private
+ 
+   def generate_csv(filename, template)
+@@ -188,4 +193,15 @@ class Api::V2::Accounts::ReportsController < Api::V1::Accounts::BaseController
+       until: params[:until]
+     }
+   end
++
++  def agent_availability_params
++    {
++      since: params[:since],
++      until: params[:until],
++      agent_id: params[:agent_id],
++      group_by: params[:group_by],
++      timezone_offset: params[:timezone_offset],
++      page: params[:page]
++    }
++  end
+ end
+diff --git a/app/javascript/dashboard/api/reports.js b/app/javascript/dashboard/api/reports.js
+index 00f040f8e..9827083d3 100644
+--- a/app/javascript/dashboard/api/reports.js
++++ b/app/javascript/dashboard/api/reports.js
+@@ -108,6 +108,19 @@ class ReportsAPI extends ApiClient {
+       },
+     });
+   }
++
++  getAgentAvailability({ from: since, to: until, agentId, groupBy, page }) {
++    return axios.get(`${this.url}/agent_availability`, {
++      params: {
++        since,
++        until,
++        agent_id: agentId,
++        group_by: groupBy,
++        page,
++        timezone_offset: getTimeOffset(),
++      },
++    });
++  }
+ }
+ 
+ export default new ReportsAPI();
+diff --git a/app/javascript/dashboard/components-next/sidebar/Sidebar.vue b/app/javascript/dashboard/components-next/sidebar/Sidebar.vue
+index e48e0591c..b82286867 100644
+--- a/app/javascript/dashboard/components-next/sidebar/Sidebar.vue
++++ b/app/javascript/dashboard/components-next/sidebar/Sidebar.vue
+@@ -258,6 +258,11 @@ const newReportRoutes = () => [
+     to: accountScopedRoute('agent_reports_index'),
+     activeOn: ['agent_reports_show'],
+   },
++  {
++    name: 'Reports Agent Availability',
++    label: t('SIDEBAR.REPORTS_AGENT_AVAILABILITY'),
++    to: accountScopedRoute('agent_availability_reports'),
++  },
+   {
+     name: 'Reports Label',
+     label: t('SIDEBAR.REPORTS_LABEL'),
+diff --git a/app/javascript/dashboard/i18n/locale/en/report.json b/app/javascript/dashboard/i18n/locale/en/report.json
+index 2ffa0ef11..58bf5fc2b 100644
+--- a/app/javascript/dashboard/i18n/locale/en/report.json
++++ b/app/javascript/dashboard/i18n/locale/en/report.json
+@@ -646,5 +646,23 @@
+     "AVG_REPLY_TIME": "Avg. Customer Waiting Time",
+     "RESOLUTION_COUNT": "Resolution Count",
+     "CONVERSATIONS": "No. of conversations"
++  },
++  "AGENT_AVAILABILITY_REPORTS": {
++    "HEADER": "Agentes Online",
++    "DESCRIPTION": "Acompanhe quanto tempo cada agente ficou online no período selecionado.",
++    "LOADING": "Carregando agentes online...",
++    "DATA_FETCHING_FAILED": "Não foi possível buscar o relatório de agentes online. Tente novamente mais tarde.",
++    "EMPTY": "Nenhuma sessão online encontrada para os filtros selecionados.",
++    "PAGINATION": "Página {current} de {total}",
++    "METRICS": {
++      "TOTAL_ONLINE": "Tempo online total",
++      "AGENTS_COUNT": "Agentes com presença"
++    },
++    "TABLE": {
++      "AGENT": "Agente",
++      "ENTRY": "Entrada",
++      "EXIT": "Saída",
++      "WORK_TIME": "Tempo de trabalho"
++    }
+   }
+ }
+diff --git a/app/javascript/dashboard/i18n/locale/en/settings.json b/app/javascript/dashboard/i18n/locale/en/settings.json
+index bfbd920a7..5c5e0f9e7 100644
+--- a/app/javascript/dashboard/i18n/locale/en/settings.json
++++ b/app/javascript/dashboard/i18n/locale/en/settings.json
+@@ -355,6 +355,7 @@
+     "REPORTS_SLA": "SLA",
+     "REPORTS_BOT": "Bot",
+     "REPORTS_AGENT": "Agents",
++    "REPORTS_AGENT_AVAILABILITY": "Agentes Online",
+     "REPORTS_LABEL": "Labels",
+     "REPORTS_INBOX": "Inbox",
+     "REPORTS_TEAM": "Team",
+diff --git a/app/javascript/dashboard/routes/dashboard/settings/reports/components/Filters/v3/ActiveFilterChip.vue b/app/javascript/dashboard/routes/dashboard/settings/reports/components/Filters/v3/ActiveFilterChip.vue
+index e37a3bc2b..ac384048a 100644
+--- a/app/javascript/dashboard/routes/dashboard/settings/reports/components/Filters/v3/ActiveFilterChip.vue
++++ b/app/javascript/dashboard/routes/dashboard/settings/reports/components/Filters/v3/ActiveFilterChip.vue
+@@ -39,6 +39,10 @@ const props = defineProps({
+     type: Boolean,
+     default: true,
+   },
++  dropdownClass: {
++    type: String,
++    default: 'w-[240px]',
++  },
+ });
+ 
+ const emit = defineEmits([
+@@ -69,7 +73,8 @@ const closeDropdown = () => emit('closeDropdown');
+         :active-filter-id="id"
+         :input-placeholder="placeholder"
+         :enable-search="enableSearch"
+-        class="flex flex-col w-[240px] overflow-y-auto left-0 md:left-auto md:right-0 top-10"
++        class="flex flex-col overflow-y-auto left-0 md:left-auto md:right-0 top-10"
++        :class="dropdownClass"
+         @select="addFilter"
+         @remove-filter="removeFilter"
+       />
+diff --git a/app/javascript/dashboard/routes/dashboard/settings/reports/components/ReportFilters.vue b/app/javascript/dashboard/routes/dashboard/settings/reports/components/ReportFilters.vue
+index 4b86aefba..ae34c4f5e 100644
+--- a/app/javascript/dashboard/routes/dashboard/settings/reports/components/ReportFilters.vue
++++ b/app/javascript/dashboard/routes/dashboard/settings/reports/components/ReportFilters.vue
+@@ -12,7 +12,9 @@ import ToggleSwitch from 'dashboard/components-next/switch/Switch.vue';
+ import { GROUP_BY_FILTER } from '../constants';
+ import { DATE_RANGE_TYPES } from 'dashboard/components/ui/DatePicker/helpers/DatePickerHelper';
+ import {
++  generateFilterURLParams,
+   generateReportURLParams,
++  parseFilterURLParams,
+   parseReportURLParams,
+ } from '../helpers/reportFilterHelper';
+ 
+@@ -40,6 +42,18 @@ const props = defineProps({
+     type: Boolean,
+     default: true,
+   },
++  navigateOnEntitySelect: {
++    type: Boolean,
++    default: true,
++  },
++  showClearEntityFilter: {
++    type: Boolean,
++    default: false,
++  },
++  entityFilterDropdownClass: {
++    type: String,
++    default: 'w-[240px]',
++  },
+ });
+ 
+ const emit = defineEmits(['filterChange']);
+@@ -177,7 +191,13 @@ const updateURLParams = () => {
+     range: selectedDateRange.value,
+   });
+ 
+-  router.replace({ query: { ...params } });
++  const filterParams = props.showEntityFilter
++    ? generateFilterURLParams({
++        [getFilterKey()]: appliedFilters.value[getFilterKey()],
++      })
++    : {};
++
++  router.replace({ query: { ...params, ...filterParams } });
+ };
+ 
+ const emitChange = () => {
+@@ -236,7 +256,7 @@ const addFilter = item => {
+   };
+ 
+   const routeName = routeNameMap[props.filterType];
+-  if (routeName) {
++  if (routeName && props.navigateOnEntitySelect) {
+     router.push({
+       name: routeName,
+       params: { ...route.params, id: item.id },
+@@ -245,6 +265,12 @@ const addFilter = item => {
+   }
+ };
+ 
++const removeEntityFilter = () => {
++  appliedFilters.value[getFilterKey()] = null;
++  closeActiveFilterDropdown();
++  emitChange();
++};
++
+ const onDateRangeChange = value => {
+   const [startDate, endDate, rangeType] = value;
+   customDateRange.value = [startDate, endDate];
+@@ -304,10 +330,14 @@ const initializeFromURL = () => {
+     }
+   }
+ 
+-  // Initialize entity filter from route params (not URL query)
++  // Initialize entity filter from route params or query params
+   if (props.showEntityFilter && route.params.id) {
+     const filterKey = getFilterKey();
+     appliedFilters.value[filterKey] = Number(route.params.id);
++  } else if (props.showEntityFilter) {
++    const filterKey = getFilterKey();
++    const filterParams = parseFilterURLParams(route.query);
++    appliedFilters.value[filterKey] = filterParams[filterKey];
+   }
+ };
+ 
+@@ -336,11 +366,13 @@ onMounted(() => {
+         :active-filter-type="activeFilterType"
+         :show-menu="showSubDropdownMenu"
+         :placeholder="filterPlaceholder"
+-        :show-clear-filter="false"
++        :show-clear-filter="showClearEntityFilter"
++        :dropdown-class="entityFilterDropdownClass"
+         enable-search
+         @toggle-dropdown="openActiveFilterDropdown"
+         @close-dropdown="closeActiveFilterDropdown"
+         @add-filter="addFilter"
++        @remove-filter="removeEntityFilter"
+       />
+ 
+       <ActiveFilterChip
+diff --git a/app/javascript/dashboard/routes/dashboard/settings/reports/reports.routes.js b/app/javascript/dashboard/routes/dashboard/settings/reports/reports.routes.js
+index af01f6d74..be19d2704 100644
+--- a/app/javascript/dashboard/routes/dashboard/settings/reports/reports.routes.js
++++ b/app/javascript/dashboard/routes/dashboard/settings/reports/reports.routes.js
+@@ -23,6 +23,7 @@ import CsatResponses from './CsatResponses.vue';
+ import BotReports from './BotReports.vue';
+ import LiveReports from './LiveReports.vue';
+ import SLAReports from './SLAReports.vue';
++import AgentAvailabilityReports from './AgentAvailabilityReports.vue';
+ 
+ const meta = {
+   featureFlag: FEATURE_FLAGS.REPORTS,
+@@ -156,6 +157,12 @@ export default {
+           meta,
+           component: SLAReports,
+         },
++        {
++          path: 'agent_availability',
++          name: 'agent_availability_reports',
++          meta,
++          component: AgentAvailabilityReports,
++        },
+         {
+           path: 'csat',
+           name: 'csat_reports',
+diff --git a/app/models/account_user.rb b/app/models/account_user.rb
+index bbcb0e010..d5b7e9161 100644
+--- a/app/models/account_user.rb
++++ b/app/models/account_user.rb
+@@ -78,6 +78,7 @@ class AccountUser < ApplicationRecord
+ 
+   def update_presence_in_redis
+     OnlineStatusTracker.set_status(account.id, user.id, availability)
++    AgentAvailabilitySessions::Tracker.close_for_account_user(account_user: self, end_reason: 'availability_changed') unless online?
+   end
+ end
+ 
+diff --git a/config/routes.rb b/config/routes.rb
+index c7079a37a..a1038d374 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -499,6 +499,7 @@ Rails.application.routes.draw do
+               get :inbox_label_matrix
+               get :first_response_time_distribution
+               get :outgoing_messages_count
++              get :agent_availability
+             end
+           end
+           resource :year_in_review, only: [:show]
+diff --git a/config/schedule.yml b/config/schedule.yml
+index f5e335ba3..a0458c6b5 100644
+--- a/config/schedule.yml
++++ b/config/schedule.yml
+@@ -26,6 +26,12 @@ trigger_imap_email_inboxes_job:
+   class: 'Inboxes::FetchImapEmailInboxesJob'
+   queue: scheduled_jobs
+ 
++# executed every minute to close online agent sessions without recent dashboard presence
++close_stale_agent_availability_sessions_job:
++  cron: '*/1 * * * *'
++  class: 'AgentAvailabilitySessions::CloseStaleSessionsJob'
++  queue: scheduled_jobs
++
+ # executed daily at 2230 UTC
+ # which is our lowest traffic time
+ remove_stale_contact_inboxes_job.rb:
+diff --git a/db/schema.rb b/db/schema.rb
+index e1b067ff0..640e58efc 100644
+--- a/db/schema.rb
++++ b/db/schema.rb
+@@ -10,7 +10,7 @@
+ #
+ # It's strongly recommended that you check this file into your version control system.
+ 
+-ActiveRecord::Schema[7.1].define(version: 2026_05_25_093000) do
++ActiveRecord::Schema[7.1].define(version: 2026_06_02_120000) do
+   # These extensions should be enabled to support this database
+   enable_extension "pg_stat_statements"
+   enable_extension "pg_trgm"
+@@ -113,6 +113,27 @@ ActiveRecord::Schema[7.1].define(version: 2026_05_25_093000) do
+     t.index ["blob_id", "variation_digest"], name: "index_active_storage_variant_records_uniqueness", unique: true
+   end
+ 
++  create_table "agent_availability_sessions", force: :cascade do |t|
++    t.bigint "account_id", null: false
++    t.bigint "account_user_id", null: false
++    t.bigint "user_id", null: false
++    t.integer "availability", default: 0, null: false
++    t.datetime "started_at", null: false
++    t.datetime "last_seen_at", null: false
++    t.datetime "ended_at"
++    t.integer "duration_seconds"
++    t.string "end_reason"
++    t.datetime "created_at", null: false
++    t.datetime "updated_at", null: false
++    t.index ["account_id", "started_at"], name: "index_agent_availability_sessions_on_account_id_and_started_at"
++    t.index ["account_id"], name: "index_agent_availability_sessions_on_account_id"
++    t.index ["account_user_id", "ended_at"], name: "idx_agent_availability_open_session"
++    t.index ["account_user_id", "started_at"], name: "idx_on_account_user_id_started_at_1aa410df6d"
++    t.index ["account_user_id"], name: "index_agent_availability_sessions_on_account_user_id"
++    t.index ["user_id", "started_at"], name: "index_agent_availability_sessions_on_user_id_and_started_at"
++    t.index ["user_id"], name: "index_agent_availability_sessions_on_user_id"
++  end
++
+   create_table "agent_bot_inboxes", force: :cascade do |t|
+     t.integer "inbox_id"
+     t.integer "agent_bot_id"
