@@ -1,0 +1,453 @@
+diff --git a/app/controllers/api/v1/accounts/conversations/messages_controller.rb b/app/controllers/api/v1/accounts/conversations/messages_controller.rb
+index 341ccf323..cee7c7e8a 100644
+--- a/app/controllers/api/v1/accounts/conversations/messages_controller.rb
++++ b/app/controllers/api/v1/accounts/conversations/messages_controller.rb
+@@ -7,6 +7,8 @@ class Api::V1::Accounts::Conversations::MessagesController < Api::V1::Accounts::
+   end
+ 
+   def create
++    return render_outgoing_message_limit_error if outgoing_message_limit_exceeded?
++
+     user = Current.user || @resource
+     mb = Messages::MessageBuilder.new(user, @conversation, params)
+     @message = mb.perform
+@@ -63,6 +65,22 @@ class Api::V1::Accounts::Conversations::MessagesController < Api::V1::Accounts::
+     authorize @conversation, :reply?
+   end
+ 
++  def outgoing_message_limit_exceeded?
++    return false if params[:private].present? && params[:private].to_s == 'true'
++    return false if params[:message_type].present? && params[:message_type] != 'outgoing'
++
++    @outgoing_message_limit = Conversations::OutgoingMessageLimitService.new(@conversation).perform
++    !@outgoing_message_limit[:can_send]
++  end
++
++  def render_outgoing_message_limit_error
++    render json: {
++      error: I18n.t('errors.messages.rate_limited', seconds: @outgoing_message_limit[:retry_after]),
++      code: 'api_channel_outgoing_rate_limit',
++      retry_after: @outgoing_message_limit[:retry_after]
++    }, status: :too_many_requests
++  end
++
+   def message
+     @message ||= @conversation.messages.find(permitted_params[:id])
+   end
+diff --git a/app/javascript/dashboard/api/inbox/message.js b/app/javascript/dashboard/api/inbox/message.js
+index 8f294a0ee..62b3f0d54 100644
+--- a/app/javascript/dashboard/api/inbox/message.js
++++ b/app/javascript/dashboard/api/inbox/message.js
+@@ -100,6 +100,10 @@ class MessageApi extends ApiClient {
+     return axios.get(`${this.url}/${conversationId}/messages`, { params });
+   }
+ 
++  getOutgoingMessageLimits(conversationId) {
++    return axios.get(`${this.url}/${conversationId}/message_limits`);
++  }
++
+   translateMessage(conversationId, messageId, targetLanguage) {
+     return axios.post(
+       `${this.url}/${conversationId}/messages/${messageId}/translate`,
+diff --git a/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue b/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue
+index 8181e068a..ae8409703 100644
+--- a/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue
++++ b/app/javascript/dashboard/components/widgets/conversation/ReplyBox.vue
+@@ -54,6 +54,7 @@ import {
+ import { useCopilotReply } from 'dashboard/composables/useCopilotReply';
+ import { useKbd } from 'dashboard/composables/utils/useKbd';
+ import { isFileTypeAllowedForChannel } from 'shared/helpers/FileHelper';
++import MessageApi from 'dashboard/api/inbox/message';
+ 
+ import { LOCAL_STORAGE_KEYS } from 'dashboard/constants/localStorage';
+ import { LocalStorage } from 'shared/helpers/localStorage';
+@@ -142,6 +143,12 @@ export default {
+       showArticleSearchPopover: false,
+       hasRecordedAudio: false,
+       copilotAcceptedMessages: {},
++      outgoingMessageLimit: {
++        canSend: true,
++        retryAfter: 0,
++        remaining: null,
++      },
++      outgoingMessageLimitTimer: null,
+     };
+   },
+   computed: {
+@@ -226,6 +233,7 @@ export default {
+     },
+     isReplyButtonDisabled() {
+       if (this.isEditorDisabled) return true;
++      if (this.isOutgoingMessageRateLimited) return true;
+       if (this.isATwitterInbox) return true;
+       if (!this.isPrivate && !this.isConversationOpen) return true;
+       if (this.hasAttachments || this.hasRecordedAudio) return false;
+@@ -295,6 +303,12 @@ export default {
+       );
+     },
+     replyButtonLabel() {
++      if (this.isOutgoingMessageRateLimited) {
++        return this.$t('CONVERSATION.REPLYBOX.WAIT_TO_SEND', {
++          seconds: this.outgoingMessageLimit.retryAfter,
++        });
++      }
++
+       let sendMessageText = this.$t('CONVERSATION.REPLYBOX.SEND');
+       if (this.isPrivate) {
+         sendMessageText = this.$t('CONVERSATION.REPLYBOX.CREATE');
+@@ -304,6 +318,11 @@ export default {
+         : '(↵)';
+       return `${sendMessageText} ${keyLabel}`;
+     },
++    isOutgoingMessageRateLimited() {
++      return (
++        this.isAPIInbox && !this.isPrivate && !this.outgoingMessageLimit.canSend
++      );
++    },
+     replyBoxClass() {
+       return {
+         'is-private': this.isPrivate,
+@@ -479,6 +498,7 @@ export default {
+       }
+ 
+       this.fetchAndSetReplyTo();
++      this.fetchOutgoingMessageLimit();
+     },
+     // When moving from one conversation to another, the store may not have the
+     // list of all the messages. A fetch is subsequently made to get the messages.
+@@ -497,6 +517,7 @@ export default {
+         this.setToDraft(oldConversationId, this.replyType);
+         this.getFromDraft();
+         this.resetRecorderAndClearAttachments();
++        this.fetchOutgoingMessageLimit();
+       }
+     },
+     message() {
+@@ -506,6 +527,7 @@ export default {
+     replyType(updatedReplyType, oldReplyType) {
+       this.setToDraft(this.conversationIdByRoute, oldReplyType);
+       this.getFromDraft();
++      this.fetchOutgoingMessageLimit();
+     },
+   },
+ 
+@@ -525,6 +547,7 @@ export default {
+     );
+ 
+     this.fetchAndSetReplyTo();
++    this.fetchOutgoingMessageLimit();
+     emitter.on(BUS_EVENTS.TOGGLE_REPLY_TO_MESSAGE, this.onReplyToMessage);
+ 
+     // A hacky fix to solve the drag and drop
+@@ -547,8 +570,112 @@ export default {
+       this.onNewConversationModalActive
+     );
+     emitter.off(CMD_AI_ASSIST, this.executeCopilotAction);
++    this.clearOutgoingMessageLimitTimer();
+   },
+   methods: {
++    shouldCheckOutgoingMessageLimit() {
++      return this.isAPIInbox && !this.isPrivate && this.conversationId;
++    },
++    resetOutgoingMessageLimit() {
++      this.clearOutgoingMessageLimitTimer();
++      this.outgoingMessageLimit = {
++        canSend: true,
++        retryAfter: 0,
++        remaining: null,
++      };
++    },
++    clearOutgoingMessageLimitTimer() {
++      if (this.outgoingMessageLimitTimer) {
++        clearInterval(this.outgoingMessageLimitTimer);
++        this.outgoingMessageLimitTimer = null;
++      }
++    },
++    startOutgoingMessageLimitTimer(retryAfter) {
++      this.clearOutgoingMessageLimitTimer();
++      this.outgoingMessageLimit = {
++        ...this.outgoingMessageLimit,
++        canSend: false,
++        retryAfter,
++      };
++
++      this.outgoingMessageLimitTimer = setInterval(() => {
++        const nextRetryAfter = this.outgoingMessageLimit.retryAfter - 1;
++        if (nextRetryAfter <= 0) {
++          this.resetOutgoingMessageLimit();
++          this.fetchOutgoingMessageLimit();
++          return;
++        }
++
++        this.outgoingMessageLimit = {
++          ...this.outgoingMessageLimit,
++          retryAfter: nextRetryAfter,
++        };
++      }, 1000);
++    },
++    applyOutgoingMessageLimit(limit) {
++      const retryAfter = limit?.retry_after || limit?.retryAfter || 0;
++      const canSend = limit?.can_send ?? limit?.canSend ?? true;
++      this.outgoingMessageLimit = {
++        canSend,
++        retryAfter,
++        remaining: limit?.remaining ?? null,
++      };
++
++      if (!canSend && retryAfter > 0) {
++        this.startOutgoingMessageLimitTimer(retryAfter);
++      } else {
++        this.clearOutgoingMessageLimitTimer();
++      }
++    },
++    async fetchOutgoingMessageLimit() {
++      if (!this.shouldCheckOutgoingMessageLimit()) {
++        this.resetOutgoingMessageLimit();
++        return true;
++      }
++
++      try {
++        const { data } = await MessageApi.getOutgoingMessageLimits(
++          this.conversationId
++        );
++        this.applyOutgoingMessageLimit(data);
++        return data.can_send;
++      } catch {
++        return true;
++      }
++    },
++    async ensureOutgoingMessageLimitAvailable(requiredMessages = 1) {
++      const canSend = await this.fetchOutgoingMessageLimit();
++      const remaining = this.outgoingMessageLimit.remaining;
++      const hasEnoughRemainingMessages =
++        remaining === null || remaining >= requiredMessages;
++
++      if (!canSend || !hasEnoughRemainingMessages) {
++        const retryAfter = this.outgoingMessageLimit.retryAfter || 60;
++        useAlert(
++          this.$t('CONVERSATION.REPLYBOX.RATE_LIMITED', {
++            seconds: retryAfter,
++          })
++        );
++        this.startOutgoingMessageLimitTimer(retryAfter);
++        return false;
++      }
++
++      return true;
++    },
++    handleOutgoingMessageLimitError(error) {
++      if (error?.response?.data?.code !== 'api_channel_outgoing_rate_limit') {
++        return false;
++      }
++
++      const retryAfter = error.response.data.retry_after || 0;
++      this.startOutgoingMessageLimitTimer(retryAfter);
++      useAlert(
++        this.$t('CONVERSATION.REPLYBOX.RATE_LIMITED', {
++          seconds: retryAfter,
++        })
++      );
++      return true;
++    },
+     getDraftKey(
+       conversationId = this.conversationIdByRoute,
+       replyType = this.replyType
+@@ -765,7 +892,7 @@ export default {
+     hideContentTemplatesModal() {
+       this.showContentTemplatesModal = false;
+     },
+-    confirmOnSendReply() {
++    async confirmOnSendReply() {
+       if (this.isReplyButtonDisabled) {
+         return;
+       }
+@@ -781,20 +908,36 @@ export default {
+         // To handle both cases, text and attachments are always sent as separate messages.
+         const isOnInstagram = this.isAnInstagramChannel;
+         const isOnTiktok = this.isATiktokChannel;
+-        if ((isOnWhatsApp || isOnInstagram || isOnTiktok) && !this.isPrivate) {
+-          this.sendMessageAsMultipleMessages(
+-            this.message,
++        const shouldSendAsMultipleMessages =
++          (isOnWhatsApp || isOnInstagram || isOnTiktok) && !this.isPrivate;
++        const messagePayloads = shouldSendAsMultipleMessages
++          ? this.getMultipleMessagesPayload(this.message)
++          : [this.getMessagePayload(this.message)];
++
++        const canSend = await this.ensureOutgoingMessageLimitAvailable(
++          messagePayloads.length
++        );
++        if (!canSend) return;
++
++        let sent = false;
++        if (shouldSendAsMultipleMessages) {
++          sent = await this.sendMessageAsMultipleMessages(
++            messagePayloads,
+             copilotAcceptedMessage
+           );
+         } else {
+-          const messagePayload = this.getMessagePayload(this.message);
+-          this.sendMessage(
++          const [messagePayload] = messagePayloads;
++          sent = await this.sendMessage(
+             messagePayload,
+             this.message,
+             copilotAcceptedMessage
+           );
+         }
+ 
++        if (!sent) return;
++
++        this.fetchOutgoingMessageLimit();
++
+         if (!this.isPrivate) {
+           this.clearEmailField();
+         }
+@@ -804,15 +947,19 @@ export default {
+         this.$emit('update:popOutReplyBox', false);
+       }
+     },
+-    sendMessageAsMultipleMessages(message, copilotAcceptedMessage = '') {
+-      const messages = this.getMultipleMessagesPayload(message);
+-      messages.forEach(messagePayload => {
+-        this.sendMessage(
++    async sendMessageAsMultipleMessages(
++      messagePayloads,
++      copilotAcceptedMessage = ''
++    ) {
++      return messagePayloads.reduce(async (previousSent, messagePayload) => {
++        if (!(await previousSent)) return false;
++
++        return this.sendMessage(
+           messagePayload,
+           messagePayload.message || '',
+           copilotAcceptedMessage
+         );
+-      });
++      }, Promise.resolve(true));
+     },
+     sendMessageAnalyticsData(
+       isPrivate,
+@@ -878,10 +1025,10 @@ export default {
+ 
+         const ok = await this.$refs.confirmDialog.showConfirmation();
+         if (ok) {
+-          this.confirmOnSendReply();
++          await this.confirmOnSendReply();
+         }
+       } else {
+-        this.confirmOnSendReply();
++        await this.confirmOnSendReply();
+       }
+     },
+     async sendMessage(
+@@ -901,10 +1048,14 @@ export default {
+           editorMessage,
+           copilotAcceptedMessage,
+         });
++        return true;
+       } catch (error) {
++        if (this.handleOutgoingMessageLimitError(error)) return false;
++
+         const errorMessage =
+           error?.response?.data?.error || this.$t('CONVERSATION.MESSAGE_ERROR');
+         useAlert(errorMessage);
++        return false;
+       }
+     },
+     async onSendWhatsAppReply(messagePayload) {
+diff --git a/app/javascript/dashboard/i18n/locale/en/conversation.json b/app/javascript/dashboard/i18n/locale/en/conversation.json
+index 467a2c34a..ff31cec6c 100644
+--- a/app/javascript/dashboard/i18n/locale/en/conversation.json
++++ b/app/javascript/dashboard/i18n/locale/en/conversation.json
+@@ -205,6 +205,8 @@
+       "PRIVATE_NOTE": "Private Note",
+       "SEND": "Send",
+       "CREATE": "Add Note",
++      "WAIT_TO_SEND": "Wait {seconds}s",
++      "RATE_LIMITED": "Sending limit reached. Try again in {seconds}s.",
+       "INSERT_READ_MORE": "Read more",
+       "DISMISS_REPLY": "Dismiss reply",
+       "REPLYING_TO": "Replying to:",
+@@ -451,4 +453,4 @@
+   "GALLERY_VIEW": {
+     "ERROR_DOWNLOADING": "Unable to download attachment. Please try again"
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json b/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
+index 123320d70..21982885a 100644
+--- a/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
++++ b/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
+@@ -205,6 +205,8 @@
+       "PRIVATE_NOTE": "Mensagem Privada",
+       "SEND": "Enviar",
+       "CREATE": "Enviar",
++      "WAIT_TO_SEND": "Aguarde {seconds}s",
++      "RATE_LIMITED": "Limite de envio atingido. Tente novamente em {seconds}s.",
+       "INSERT_READ_MORE": "Saiba mais",
+       "DISMISS_REPLY": "Dispensar resposta",
+       "REPLYING_TO": "Respondendo a:",
+diff --git a/app/javascript/dashboard/store/modules/conversations/actions.js b/app/javascript/dashboard/store/modules/conversations/actions.js
+index c6a197d85..8dea4bfa8 100644
+--- a/app/javascript/dashboard/store/modules/conversations/actions.js
++++ b/app/javascript/dashboard/store/modules/conversations/actions.js
+@@ -282,7 +282,7 @@ const actions = {
+ 
+   createPendingMessageAndSend: async ({ dispatch }, data) => {
+     const pendingMessage = createPendingMessage(data);
+-    dispatch('sendMessageWithData', pendingMessage);
++    return dispatch('sendMessageWithData', pendingMessage);
+   },
+ 
+   sendMessageWithData: async ({ commit }, pendingMessage) => {
+diff --git a/config/locales/en.yml b/config/locales/en.yml
+index b0f1f4e2e..2e09fb960 100644
+--- a/config/locales/en.yml
++++ b/config/locales/en.yml
+@@ -87,6 +87,7 @@ en:
+       search:
+         query_missing: Specify search string with parameter q
+     messages:
++      rate_limited: Sending limit reached. Try again in %{seconds}s.
+       search:
+         time_range_limit_exceeded: 'Search is limited to the last %{days} days'
+     categories:
+diff --git a/config/locales/pt_BR.yml b/config/locales/pt_BR.yml
+index 651afe295..1d7dfaf06 100644
+--- a/config/locales/pt_BR.yml
++++ b/config/locales/pt_BR.yml
+@@ -74,6 +74,7 @@ pt_BR:
+       search:
+         query_missing: Especifique a string de busca com o parâmetro q
+     messages:
++      rate_limited: Limite de envio atingido. Tente novamente em %{seconds}s.
+       search:
+         time_range_limit_exceeded: 'A pesquisa está limitada aos últimos %{days} dias'
+     categories:
+diff --git a/config/routes.rb b/config/routes.rb
+index 9d442600e..96696b3be 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -135,6 +135,7 @@ Rails.application.routes.draw do
+                   post :retry
+                 end
+               end
++              resource :message_limits, only: [:show]
+               resources :assignments, only: [:create]
+               resources :labels, only: [:create, :index]
+               resource :participants, only: [:show, :create, :update, :destroy]
+diff --git a/lib/limits.rb b/lib/limits.rb
+index ce8ab7872..dcbdc6dab 100644
+--- a/lib/limits.rb
++++ b/lib/limits.rb
+@@ -14,4 +14,8 @@ module Limits
+   def self.conversation_message_per_minute_limit
+     ENV.fetch('CONVERSATION_MESSAGE_PER_MINUTE_LIMIT', '200').to_i
+   end
++
++  def self.api_channel_outgoing_message_per_minute_limit
++    ENV.fetch('API_CHANNEL_OUTGOING_MESSAGE_PER_MINUTE_LIMIT', '10').to_i
++  end
+ end

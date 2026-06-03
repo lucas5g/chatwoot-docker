@@ -1,0 +1,20 @@
+diff --git a/app/javascript/dashboard/routes/dashboard/conversation/ContactConversations.vue b/app/javascript/dashboard/routes/dashboard/conversation/ContactConversations.vue
+index 50268db62..7b8259922 100644
+--- a/app/javascript/dashboard/routes/dashboard/conversation/ContactConversations.vue
++++ b/app/javascript/dashboard/routes/dashboard/conversation/ContactConversations.vue
+@@ -118,13 +118,13 @@ watch(
+     if (newId && newId !== oldId) {
+       showContextMenu.value = false;
+       activeContextChat.value = null;
+-      store.dispatch('contactConversations/get', newId);
++      store.dispatch('contactConversations/get', { contactId: newId });
+     }
+   }
+ );
+ 
+ onMounted(() => {
+-  store.dispatch('contactConversations/get', props.contactId);
++  store.dispatch('contactConversations/get', { contactId: props.contactId });
+ });
+ </script>
+ 
