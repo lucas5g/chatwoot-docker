@@ -1,0 +1,66 @@
+diff --git a/app/javascript/dashboard/components-next/Contacts/Pages/ContactDetails.vue b/app/javascript/dashboard/components-next/Contacts/Pages/ContactDetails.vue
+index b7014c42f..97100e6e1 100644
+--- a/app/javascript/dashboard/components-next/Contacts/Pages/ContactDetails.vue
++++ b/app/javascript/dashboard/components-next/Contacts/Pages/ContactDetails.vue
+@@ -3,6 +3,10 @@ import { computed, ref, onMounted } from 'vue';
+ import { useI18n } from 'vue-i18n';
+ import { useStore, useMapGetter } from 'dashboard/composables/store';
+ import { useAlert } from 'dashboard/composables';
++import {
++  DuplicateContactException,
++  ExceptionWithMessage,
++} from 'shared/helpers/CustomErrors';
+ import { dynamicTime } from 'shared/helpers/timeHelper';
+ 
+ import Avatar from 'dashboard/components-next/avatar/Avatar.vue';
+@@ -67,6 +71,41 @@ const handleFormUpdate = updatedData => {
+   Object.assign(contactData.value, updatedData);
+ };
+ 
++const showUpdateErrorAlert = error => {
++  const invalidAttrs = Array.isArray(error.data) ? error.data : [];
++
++  if (error instanceof DuplicateContactException) {
++    if (invalidAttrs.includes('email')) {
++      useAlert(
++        t('CONTACTS_LAYOUT.CARD.EDIT_DETAILS_FORM.FORM.EMAIL_ADDRESS.DUPLICATE')
++      );
++      return;
++    }
++
++    if (invalidAttrs.includes('phone_number')) {
++      useAlert(
++        t('CONTACTS_LAYOUT.CARD.EDIT_DETAILS_FORM.FORM.PHONE_NUMBER.DUPLICATE')
++      );
++      return;
++    }
++
++    useAlert(
++      error.contactErrorDetail ||
++        t('CONTACTS_LAYOUT.CARD.EDIT_DETAILS_FORM.ERROR_MESSAGE')
++    );
++    return;
++  }
++
++  if (error instanceof ExceptionWithMessage) {
++    useAlert(error.data);
++    return;
++  }
++
++  useAlert(
++    error.message || t('CONTACTS_LAYOUT.CARD.EDIT_DETAILS_FORM.ERROR_MESSAGE')
++  );
++};
++
+ const updateContact = async () => {
+   try {
+     const { customAttributes, ...basicContactData } = contactData.value;
+@@ -77,7 +116,7 @@ const updateContact = async () => {
+     );
+     useAlert(t('CONTACTS_LAYOUT.CARD.EDIT_DETAILS_FORM.SUCCESS_MESSAGE'));
+   } catch (error) {
+-    useAlert(t('CONTACTS_LAYOUT.CARD.EDIT_DETAILS_FORM.ERROR_MESSAGE'));
++    showUpdateErrorAlert(error);
+   }
+ };
+ 
