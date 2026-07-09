@@ -1,0 +1,503 @@
+diff --git a/app/controllers/api/v1/accounts/conversations/messages_controller.rb b/app/controllers/api/v1/accounts/conversations/messages_controller.rb
+index cee7c7e8a..cbabba75a 100644
+--- a/app/controllers/api/v1/accounts/conversations/messages_controller.rb
++++ b/app/controllers/api/v1/accounts/conversations/messages_controller.rb
+@@ -1,6 +1,7 @@
+ class Api::V1::Accounts::Conversations::MessagesController < Api::V1::Accounts::Conversations::BaseController
+   before_action :ensure_api_inbox, only: :update
+-  before_action :authorize_reply, only: :create
++  before_action :ensure_api_inbox, only: :edit_content
++  before_action :authorize_reply, only: [:create, :edit_content]
+ 
+   def index
+     @messages = message_finder.perform
+@@ -21,6 +22,13 @@ class Api::V1::Accounts::Conversations::MessagesController < Api::V1::Accounts::
+     @message = message
+   end
+ 
++  def edit_content
++    Evolution::UpdateMessageService.new(message: message, content: edit_content_params[:content]).perform
++    @message = message.reload
++  rescue Evolution::UpdateMessageService::Error => e
++    render json: { error: e.message }, status: :unprocessable_entity
++  end
++
+   def destroy
+     ActiveRecord::Base.transaction do
+       message.update!(content: I18n.t('conversations.messages.deleted'), content_type: :text, content_attributes: { deleted: true })
+@@ -93,6 +101,10 @@ class Api::V1::Accounts::Conversations::MessagesController < Api::V1::Accounts::
+     params.permit(:id, :target_language, :status, :external_error)
+   end
+ 
++  def edit_content_params
++    params.permit(:content)
++  end
++
+   def already_translated_content_available?
+     message.translations.present? && message.translations[permitted_params[:target_language]].present?
+   end
+diff --git a/app/javascript/dashboard/api/inbox/message.js b/app/javascript/dashboard/api/inbox/message.js
+index c4505edd3..4df36660e 100644
+--- a/app/javascript/dashboard/api/inbox/message.js
++++ b/app/javascript/dashboard/api/inbox/message.js
+@@ -98,6 +98,13 @@ class MessageApi extends ApiClient {
+     );
+   }
+ 
++  editContent(conversationID, messageId, content) {
++    return axios.patch(
++      `${this.url}/${conversationID}/messages/${messageId}/edit_content`,
++      { content }
++    );
++  }
++
+   getPreviousMessages({ conversationId, after, before }) {
+     const params = { before };
+     if (after && Number(after) !== Number(before)) {
+diff --git a/app/javascript/dashboard/components-next/message/Message.vue b/app/javascript/dashboard/components-next/message/Message.vue
+index 9d7081e03..060865f8e 100644
+--- a/app/javascript/dashboard/components-next/message/Message.vue
++++ b/app/javascript/dashboard/components-next/message/Message.vue
+@@ -10,7 +10,7 @@ import { useRoute } from 'vue-router';
+ import { LocalStorage } from 'shared/helpers/localStorage';
+ import { ACCOUNT_EVENTS } from 'dashboard/helper/AnalyticsHelper/events';
+ import { LOCAL_STORAGE_KEYS } from 'dashboard/constants/localStorage';
+-import { getInboxIconByType } from 'dashboard/helper/inbox';
++import { getInboxIconByType, INBOX_TYPES } from 'dashboard/helper/inbox';
+ import { BUS_EVENTS } from 'shared/constants/busEvents';
+ import {
+   MESSAGE_TYPES,
+@@ -365,6 +365,7 @@ const payloadForContextMenu = computed(() => {
+     content_attributes: props.contentAttributes,
+     content: props.content,
+     conversation_id: props.conversationId,
++    source_id: props.sourceId,
+   };
+ });
+ 
+@@ -372,6 +373,8 @@ const contextMenuEnabledOptions = computed(() => {
+   const hasText = !!props.content;
+ 
+   const isOutgoing = props.messageType === MESSAGE_TYPES.OUTGOING;
++  const channelType = inbox.value.channel_type || inbox.value.channelType;
++  const isApiInbox = channelType === INBOX_TYPES.API;
+   const isFailedOrProcessing =
+     props.status === MESSAGE_STATUS.FAILED ||
+     props.status === MESSAGE_STATUS.PROGRESS;
+@@ -379,6 +382,14 @@ const contextMenuEnabledOptions = computed(() => {
+   return {
+     copy: hasText,
+     delete: false,
++    edit:
++      isApiInbox &&
++      isOutgoing &&
++      hasText &&
++      !props.private &&
++      !isMessageDeleted.value &&
++      !isFailedOrProcessing &&
++      props.contentType === CONTENT_TYPES.TEXT,
+     cannedResponse: isOutgoing && hasText && !isMessageDeleted.value,
+     copyLink: !isFailedOrProcessing,
+     translate: !isFailedOrProcessing && !isMessageDeleted.value && hasText,
+diff --git a/app/javascript/dashboard/components-next/message/MessageMeta.vue b/app/javascript/dashboard/components-next/message/MessageMeta.vue
+index f26339cbb..e13771cfa 100644
+--- a/app/javascript/dashboard/components-next/message/MessageMeta.vue
++++ b/app/javascript/dashboard/components-next/message/MessageMeta.vue
+@@ -1,5 +1,6 @@
+ <script setup>
+ import { computed } from 'vue';
++import { useI18n } from 'vue-i18n';
+ import { messageTimestamp } from 'shared/helpers/timeHelper';
+ 
+ import MessageStatus from './MessageStatus.vue';
+@@ -7,7 +8,11 @@ import Icon from 'next/icon/Icon.vue';
+ import { useInbox } from 'dashboard/composables/useInbox';
+ import { useMessageContext } from './provider.js';
+ 
+-import { MESSAGE_STATUS, MESSAGE_TYPES } from './constants';
++import {
++  EVOLUTION_EDITED_MESSAGE_MARKER,
++  MESSAGE_STATUS,
++  MESSAGE_TYPES,
++} from './constants';
+ 
+ const {
+   isAFacebookInbox,
+@@ -27,15 +32,29 @@ const {
+   status,
+   isPrivate,
+   createdAt,
++  content,
+   sourceId,
+   messageType,
+   contentAttributes,
+ } = useMessageContext();
+ 
++const { t } = useI18n();
++
+ const readableTime = computed(() =>
+   messageTimestamp(createdAt.value, 'LLL d, h:mm a')
+ );
+ 
++const isEditedMessage = computed(() => {
++  return (
++    content.value?.includes(EVOLUTION_EDITED_MESSAGE_MARKER) ||
++    contentAttributes.value?.edited
++  );
++});
++
++const editedMessageLabel = computed(
++  () => `${t('CONVERSATION.CONTEXT_MENU.EDITED_MESSAGE_LABEL')}:`
++);
++
+ const showStatusIndicator = computed(() => {
+   if (isPrivate.value) return false;
+   // Don't show status for failed messages, we already show error message
+@@ -133,6 +152,9 @@ const statusToShow = computed(() => {
+ 
+ <template>
+   <div class="text-xs flex items-center gap-1.5">
++    <span v-if="isEditedMessage" class="font-semibold">
++      {{ editedMessageLabel }}
++    </span>
+     <div class="inline">
+       <time class="inline">{{ readableTime }}</time>
+     </div>
+diff --git a/app/javascript/dashboard/components-next/message/bubbles/Base.vue b/app/javascript/dashboard/components-next/message/bubbles/Base.vue
+index 457b583ea..7923af771 100644
+--- a/app/javascript/dashboard/components-next/message/bubbles/Base.vue
++++ b/app/javascript/dashboard/components-next/message/bubbles/Base.vue
+@@ -9,13 +9,17 @@ import { useI18n } from 'vue-i18n';
+ 
+ import MessageFormatter from 'shared/helpers/MessageFormatter.js';
+ import { BUS_EVENTS } from 'shared/constants/busEvents';
+-import { MESSAGE_VARIANTS, ORIENTATION } from '../constants';
++import {
++  EVOLUTION_EDITED_MESSAGE_MARKER,
++  MESSAGE_VARIANTS,
++  ORIENTATION,
++} from '../constants';
+ 
+ const props = defineProps({
+   hideMeta: { type: Boolean, default: false },
+ });
+ 
+-const { variant, orientation, inReplyTo, shouldGroupWithNext } =
++const { content, variant, orientation, inReplyTo, shouldGroupWithNext } =
+   useMessageContext();
+ const { t } = useI18n();
+ 
+@@ -91,6 +95,10 @@ const replyToPreview = computed(() => {
+ 
+   return t('CONVERSATION.REPLY_MESSAGE_NOT_FOUND');
+ });
++
++const isEditedMessage = computed(() => {
++  return content.value?.includes(EVOLUTION_EDITED_MESSAGE_MARKER);
++});
+ </script>
+ 
+ <template>
+@@ -104,7 +112,7 @@ const replyToPreview = computed(() => {
+     ]"
+   >
+     <div
+-      v-if="inReplyTo"
++      v-if="inReplyTo && !isEditedMessage"
+       class="p-2 -mx-1 mb-2 rounded-lg cursor-pointer bg-n-alpha-black1"
+       @click="scrollToMessage"
+     >
+diff --git a/app/javascript/dashboard/components-next/message/bubbles/Text/FormattedContent.vue b/app/javascript/dashboard/components-next/message/bubbles/Text/FormattedContent.vue
+index 34b9a0070..731fb71c2 100644
+--- a/app/javascript/dashboard/components-next/message/bubbles/Text/FormattedContent.vue
++++ b/app/javascript/dashboard/components-next/message/bubbles/Text/FormattedContent.vue
+@@ -1,9 +1,13 @@
+ <script setup>
+ import { computed } from 'vue';
++import { useI18n } from 'vue-i18n';
+ import { useMessageContext } from '../../provider.js';
+ 
+ import MessageFormatter from 'shared/helpers/MessageFormatter.js';
+-import { MESSAGE_VARIANTS } from '../../constants';
++import {
++  EVOLUTION_EDITED_MESSAGE_MARKER,
++  MESSAGE_VARIANTS,
++} from '../../constants';
+ 
+ const props = defineProps({
+   content: {
+@@ -13,13 +17,52 @@ const props = defineProps({
+ });
+ 
+ const { variant } = useMessageContext();
++const { t } = useI18n();
++
++const editedMessageLabel = computed(
++  () => `${t('CONVERSATION.CONTEXT_MENU.EDITED_MESSAGE_LABEL')}:`
++);
++
++const escapeRegExp = value => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
++
++const removeEditedMessageSignature = content => {
++  const label = escapeRegExp(editedMessageLabel.value);
++  const signatureLine = new RegExp(
++    `^${label}\\s*\\n+\\*?[^\\n]+:\\*?\\s*\\n+`
++  );
++
++  return content.replace(signatureLine, `${editedMessageLabel.value}\n\n`);
++};
++
++const removeEditedMessageLabel = content => {
++  const label = escapeRegExp(editedMessageLabel.value);
++  return content.replace(new RegExp(`^${label}\\s*`), '');
++};
++
++const translatedContent = computed(() => {
++  const isEditedMessage = props.content.includes(EVOLUTION_EDITED_MESSAGE_MARKER);
++  const contentFromEditMarker = isEditedMessage
++    ? props.content.slice(props.content.indexOf(EVOLUTION_EDITED_MESSAGE_MARKER))
++    : props.content;
++
++  const content = contentFromEditMarker
++    .replace(/`?Edited Message:`?/g, editedMessageLabel.value)
++    .replace(
++      /`?Edited Message`?/g,
++      t('CONVERSATION.CONTEXT_MENU.EDITED_MESSAGE_LABEL')
++    );
++
++  return isEditedMessage
++    ? removeEditedMessageLabel(removeEditedMessageSignature(content))
++    : content;
++});
+ 
+ const formattedContent = computed(() => {
+   if (variant.value === MESSAGE_VARIANTS.ACTIVITY) {
+-    return props.content;
++    return translatedContent.value;
+   }
+ 
+-  return new MessageFormatter(props.content).formattedMessage;
++  return new MessageFormatter(translatedContent.value).formattedMessage;
+ });
+ </script>
+ 
+diff --git a/app/javascript/dashboard/components-next/message/constants.js b/app/javascript/dashboard/components-next/message/constants.js
+index 517c083a1..abdaada64 100644
+--- a/app/javascript/dashboard/components-next/message/constants.js
++++ b/app/javascript/dashboard/components-next/message/constants.js
+@@ -5,6 +5,8 @@ export const MESSAGE_TYPES = {
+   TEMPLATE: 3,
+ };
+ 
++export const EVOLUTION_EDITED_MESSAGE_MARKER = 'Edited Message';
++
+ export const MESSAGE_VARIANTS = {
+   USER: 'user',
+   AGENT: 'agent',
+diff --git a/app/javascript/dashboard/i18n/locale/en/conversation.json b/app/javascript/dashboard/i18n/locale/en/conversation.json
+index c80155900..7e967bc70 100644
+--- a/app/javascript/dashboard/i18n/locale/en/conversation.json
++++ b/app/javascript/dashboard/i18n/locale/en/conversation.json
+@@ -298,6 +298,15 @@
+     "CONTEXT_MENU": {
+       "COPY": "Copy",
+       "REPLY_TO": "Reply to this message",
++      "EDIT": "Edit",
++      "EDIT_TITLE": "Edit message",
++      "EDIT_DESCRIPTION": "This will update the message in WhatsApp using Evolution.",
++      "EDIT_PLACEHOLDER": "Type the updated message",
++      "EDIT_CANCEL": "Cancel",
++      "EDIT_SAVE": "Save changes",
++      "EDITED_MESSAGE_LABEL": "Edited Message",
++      "EDIT_SUCCESS": "Message edited successfully",
++      "EDIT_ERROR": "Couldn't edit message. Try again",
+       "DELETE": "Delete",
+       "CREATE_A_CANNED_RESPONSE": "Add to canned responses",
+       "TRANSLATE": "Translate",
+diff --git a/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json b/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
+index 6e40fb586..d62a5e4a6 100644
+--- a/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
++++ b/app/javascript/dashboard/i18n/locale/pt_BR/conversation.json
+@@ -297,6 +297,15 @@
+     "CONTEXT_MENU": {
+       "COPY": "Copiar",
+       "REPLY_TO": "Responder mensagem",
++      "EDIT": "Editar",
++      "EDIT_TITLE": "Editar mensagem",
++      "EDIT_DESCRIPTION": "Isso atualizará a mensagem no WhatsApp usando a Evolution.",
++      "EDIT_PLACEHOLDER": "Digite a mensagem atualizada",
++      "EDIT_CANCEL": "Cancelar",
++      "EDIT_SAVE": "Salvar alterações",
++      "EDITED_MESSAGE_LABEL": "Editada",
++      "EDIT_SUCCESS": "Mensagem editada com sucesso",
++      "EDIT_ERROR": "Não foi possível editar a mensagem. Tente novamente",
+       "DELETE": "Excluir",
+       "CREATE_A_CANNED_RESPONSE": "Adicionar às respostas prontas",
+       "TRANSLATE": "Traduzir",
+diff --git a/app/javascript/dashboard/modules/conversations/components/MessageContextMenu.vue b/app/javascript/dashboard/modules/conversations/components/MessageContextMenu.vue
+index a100b379f..fa4037a35 100644
+--- a/app/javascript/dashboard/modules/conversations/components/MessageContextMenu.vue
++++ b/app/javascript/dashboard/modules/conversations/components/MessageContextMenu.vue
+@@ -56,6 +56,9 @@ export default {
+     return {
+       isCannedResponseModalOpen: false,
+       showDeleteModal: false,
++      showEditModal: false,
++      editContent: '',
++      isEditing: false,
+     };
+   },
+   computed: {
+@@ -76,6 +79,10 @@ export default {
+     messageContent() {
+       return this.message.content;
+     },
++    canConfirmEdit() {
++      const content = this.editContent.trim();
++      return !!content && content !== this.messageContent && !this.isEditing;
++    },
+     contentAttributes() {
+       return useSnakeCase(
+         this.message.content_attributes ?? this.message.contentAttributes
+@@ -133,6 +140,33 @@ export default {
+       this.$emit('replyTo', this.message);
+       this.handleClose();
+     },
++    openEditModal() {
++      this.editContent = this.messageContent;
++      this.handleClose();
++      this.showEditModal = true;
++    },
++    closeEditModal() {
++      this.showEditModal = false;
++      this.editContent = '';
++      this.isEditing = false;
++    },
++    async confirmEdit() {
++      if (!this.canConfirmEdit) return;
++
++      this.isEditing = true;
++      try {
++        await this.$store.dispatch('editMessage', {
++          conversationId: this.conversationId,
++          messageId: this.messageId,
++          content: this.editContent.trim(),
++        });
++        useAlert(this.$t('CONVERSATION.CONTEXT_MENU.EDIT_SUCCESS'));
++        this.closeEditModal();
++      } catch (error) {
++        this.isEditing = false;
++        useAlert(this.$t('CONVERSATION.CONTEXT_MENU.EDIT_ERROR'));
++      }
++    },
+     openDeleteModal() {
+       this.handleClose();
+       this.showDeleteModal = true;
+@@ -169,6 +203,43 @@ export default {
+         :on-close="hideCannedResponseModal"
+       />
+     </woot-modal>
++    <!-- Edit Message -->
++    <woot-modal
++      v-if="showEditModal && enabledOptions['edit']"
++      v-model:show="showEditModal"
++      :on-close="closeEditModal"
++    >
++      <div class="flex flex-col gap-4 p-6 bg-n-background rounded-lg">
++        <div>
++          <h2 class="text-base font-medium text-n-slate-12">
++            {{ $t('CONVERSATION.CONTEXT_MENU.EDIT_TITLE') }}
++          </h2>
++          <p class="mt-1 text-sm text-n-slate-11">
++            {{ $t('CONVERSATION.CONTEXT_MENU.EDIT_DESCRIPTION') }}
++          </p>
++        </div>
++        <textarea
++          v-model="editContent"
++          class="min-h-32 w-full rounded-lg border border-n-strong bg-n-background p-3 text-sm text-n-slate-12 outline-none focus:border-n-brand"
++          :placeholder="$t('CONVERSATION.CONTEXT_MENU.EDIT_PLACEHOLDER')"
++        />
++        <div class="flex justify-end gap-2">
++          <NextButton
++            faded
++            slate
++            :label="$t('CONVERSATION.CONTEXT_MENU.EDIT_CANCEL')"
++            @click="closeEditModal"
++          />
++          <NextButton
++            blue
++            :disabled="!canConfirmEdit"
++            :is-loading="isEditing"
++            :label="$t('CONVERSATION.CONTEXT_MENU.EDIT_SAVE')"
++            @click="confirmEdit"
++          />
++        </div>
++      </div>
++    </woot-modal>
+     <!-- Confirm Deletion -->
+     <woot-delete-modal
+       v-if="showDeleteModal && enabledOptions['delete']"
+@@ -191,7 +262,7 @@ export default {
+       @click="handleOpen"
+     />
+     <ContextMenu
+-      v-if="isOpen && !isCannedResponseModalOpen"
++      v-if="isOpen && !isCannedResponseModalOpen && !showEditModal"
+       :x="contextMenuPosition.x"
+       :y="contextMenuPosition.y"
+       @close="handleClose"
+@@ -206,6 +277,15 @@ export default {
+           variant="icon"
+           @click.stop="handleReplyTo"
+         />
++        <MenuItem
++          v-if="enabledOptions['edit']"
++          :option="{
++            icon: 'edit',
++            label: $t('CONVERSATION.CONTEXT_MENU.EDIT'),
++          }"
++          variant="icon"
++          @click.stop="openEditModal"
++        />
+         <MenuItem
+           v-if="enabledOptions['copy']"
+           :option="{
+diff --git a/app/javascript/dashboard/store/modules/conversations/actions.js b/app/javascript/dashboard/store/modules/conversations/actions.js
+index 76d1bf627..92a84542b 100644
+--- a/app/javascript/dashboard/store/modules/conversations/actions.js
++++ b/app/javascript/dashboard/store/modules/conversations/actions.js
+@@ -359,6 +359,22 @@ const actions = {
+     }
+   },
+ 
++  editMessage: async function editMessage(
++    { commit },
++    { conversationId, messageId, content }
++  ) {
++    try {
++      const { data } = await MessageApi.editContent(
++        conversationId,
++        messageId,
++        content
++      );
++      commit(types.ADD_MESSAGE, data);
++    } catch (error) {
++      throw new Error(error);
++    }
++  },
++
+   deleteConversation: async ({ commit, dispatch }, conversationId) => {
+     try {
+       await ConversationApi.delete(conversationId);
+diff --git a/config/routes.rb b/config/routes.rb
+index 437b2f442..eb4680723 100644
+--- a/config/routes.rb
++++ b/config/routes.rb
+@@ -143,6 +143,7 @@ Rails.application.routes.draw do
+             scope module: :conversations do
+               resources :messages, only: [:index, :create, :destroy, :update] do
+                 member do
++                  patch :edit_content
+                   post :translate
+                   post :retry
+                 end
